@@ -12,18 +12,21 @@ devices.json
 company.local.json
 
 # 런타임 상태
-ledger/
+#
+# 경로를 루트에 고정한다. 앵커 없는 `ledger/` 는 하위 디렉터리 이름까지
+# 매칭해서 `src/ledger/` 소스가 조용히 커밋에서 빠졌다. 실제로 겪은 사고다.
+/ledger/
+/runs/
+/.work/
 events.jsonl
-runs/
-.work/
 SEAT-CONTRACT.local.md
 
 # 브라우저 프로필 (쿠키 확산 방지)
-browser-profiles/
+/browser-profiles/
 
 # 증거물
-artifacts/screenshots/
-artifacts/evidence/
+/artifacts/screenshots/
+/artifacts/evidence/
 
 # 의존성·빌드
 node_modules/

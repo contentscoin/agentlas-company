@@ -8,8 +8,12 @@
   "engines": {
     "node": ">=20"
   },
+  "bin": {
+    "company": "dist/cli.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "company": "node dist/cli.js",
     "test": "vitest --run",
     "gate:apikey": "node scripts/gates/no-api-keys.mjs",
     "gate:flags": "node scripts/gates/no-danger-flags.mjs",

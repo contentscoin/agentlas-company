@@ -30,17 +30,27 @@
   - 시연: `company security verify`가 구역 위반 시도를 전부 거부하고 표로 보고
   - _Requirements: R15_
 
-- [ ] 4. 해시체인 원장
-  - append-only JSONL, `prevHash` 체인, 체인 검증, 쓰기 권한 단일화
-  - 조회 필터, 리플레이, 암호화 오프사이트 백업
-  - 시연: `company history --since 1h` 타임라인, `company replay <run-id>`, 개조 검출
+- [x] 4. 해시체인 원장
+  - [x] append-only JSONL, `prevHash` SHA-256 체인, fsync, 재시작 후 체인 연결
+  - [x] `verify()` — 내용 개조·해시 재계산 개조·이벤트 삭제·잘린 줄을 각각 다른 문제로 구분
+  - [x] 손상 시 `lastGoodSeq` 보고 (조용히 넘어가지 않는다)
+  - [x] 필터 조회(시간·주체·종류·등급·런·오염)와 `replay(runId)`
+  - [x] 본문은 원장 밖, `payloadDigest` 만 기록
+  - [x] 시연: `company history`, `company verify` 동작 확인
+  - [ ] 4.1 암호화 오프사이트 백업 (R9.6) — 키 관리 방식 미정
   - _Requirements: R9_
 
-- [ ] 5. Seat Broker
-  - 좌석별 동시성·일일 예산·지수 백오프·타임아웃·프로세스 트리 종료
-  - 환경 위생(API 키 삭제), per-run 작업 디렉터리, 폴백 체인, 만료 감지
-  - 가짜 좌석으로 큐·예산 소진·폴백·취소 검증 후 실좌석 1개 스모크
-  - 시연: `company ask --persona ceo "..."` → 좌석 응답 + 원장 이벤트 1건
+- [x] 5. Seat Broker
+  - [x] 좌석별 동시성 세마포어, 예산 집계, 폴백 체인, 타임아웃 시 프로세스 트리 종료
+  - [x] 환경 위생 강제(API 키 삭제), per-run 작업 디렉터리 (R2.5)
+  - [x] 프로필 격리 — `configHomeEnv` 임시 디렉터리 + 인증 파일만 복사. codex 실측 확인
+  - [x] 판정은 종료코드와 산출 파일로만. stderr 존재는 실패가 아니다
+  - [x] 미검증 좌석은 `allowUnverified` 없이 쓰지 않는다
+  - [x] 크로스벤더 강제 — 후보가 없으면 폴백하지 않고 실패 (R3.4 보호)
+  - [x] 쿼터 소진 좌석을 창 종료까지 제외 (실측 문구 기반)
+  - [x] 모든 호출과 거부를 원장에 기록, 오염 자동 전파
+  - [x] 시연: `company ask --persona ceo "..."` → codex 응답 10,874ms, 원장 1건, verify 정상
+  - [ ] 5.1 예산 카운터 영속화 — 지금은 프로세스 메모리에만 있어 재시작 시 초기화된다
   - _Requirements: R1.1, R1.4, R2_
 
 - [ ] 6. 조직과 회의
