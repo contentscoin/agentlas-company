@@ -1,26 +1,39 @@
 # 업스트림 커밋 핀
 #
 # 네 개의 업스트림을 소스 복사(벤더링) 없이 커밋 핀으로 소비한다.
-# Task 2에서 실제 커밋 SHA로 채운다.
-# 값이 비어 있는 동안 런타임 코드를 추가하지 않는다.
+# SHA 는 2026-07-30 실측값이다. 갱신 시 갱신 사유를 커밋 메시지에 남긴다.
 
 upstreams:
   ai-company-discord:
-    repo: https://github.com/contentscoin/ai-company-discord
-    commit: ""
+    repo: https://github.com/contentscoin/ai-company-discord.git
+    commit: 46e82f40874b7f2a193bc94573cccd1b3073620a
     consumes: "회의 프로토콜(DECISION/VERDICT), companyctl --json 계약"
+    notes: "RUNTIME-CONTRACT.md 존재 — 런타임 실측 완료. CURSOR-CONTRACT.md 없음 — Cursor 실측 미완"
+
   social-ai-team-custom:
-    repo: ""
-    commit: ""
-    consumes: "proc.js 프로세스 계층, 채널 실행, 브랜드 팩 규약"
+    repo: https://github.com/contentscoin/social-ai-team-custom.git
+    commit: f28df3d8048fe67fc3e0efd1d2389ca6e63f8b93
+    consumes: "desktop/lib/proc.js 프로세스 계층, 채널 실행, 브랜드 팩 규약"
+    notes: "proc.js 7247 bytes. envWithPath/resolveCmd/quoteArg/runCmd/killTree/killAll 를 export"
+
   agentlas-sei:
-    repo: https://github.com/contentscoin/agentlas-sei
-    commit: ""
+    repo: https://github.com/contentscoin/agentlas-sei.git
+    commit: 608bde014514485f1fb1e1a3183d7b74a8ad0a0f
     consumes: "클레임/증거/모순 검증 엔진, digest 바인딩 리뷰"
+
   Agentlas-OS:
-    repo: https://github.com/contentscoin/Agentlas-OS
-    commit: ""
+    repo: https://github.com/contentscoin/Agentlas-OS.git
+    commit: dd12f6201587d649900fb3955dfff27c98da5e07
     consumes: "에이전트 패키지 build/borrow, Hub 차용"
+
+# proc.js 에서 확인된 재사용 대상 (Task 2 에서 @company/proc 으로 추출)
+# 원문 인용 — 이 주석들이 추출 근거다
+#   L1-2  "GUI apps don't inherit the terminal PATH, and Node's
+#          spawn(shell:true) joins args WITHOUT quoting. Both bite hard on Windows."
+#   L30   "extra values of undefined mean \"remove this var\" (e.g. drop a stale API key)"
+#   L31   for (const [k, v] of Object.entries(extra)) if (v === undefined) delete env[k];
+#   L64   if (isWin && child.pid) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], ...)
+# L30-31 이 R1.1(API 키 제거로 OAuth 강제)의 구현 근거다.
 
 # 차용된 Hub 에이전트 패키지도 여기에 digest로 핀한다 (R13.2)
 borrowed_agents: []
