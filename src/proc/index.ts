@@ -1,0 +1,178 @@
+/**
+ * 프로세스 계층 — 좌석 CLI 를 띄우고 확실하게 죽인다.
+ *
+ * 이 모듈은 업스트림 social-ai-team-custom 의 desktop/lib/proc.js 를
+ * TypeScript 로 이식한 것이다. 원본 커밋은 vendor.lock 에 핀되어 있다.
+ * 원본 주석 인용 (L1-2):
+ *   "GUI apps don't inherit the terminal PATH, and Node's
+ *    spawn(shell:true) joins args WITHOUT quoting. Both bite hard on Windows."
+ *
+ * 이식하면서 우리 요구에 맞춰 더한 것:
+ *   - isAlive: signal 0 을 쓰지 않는 Windows 안전 생존 확인
+ *   - 종료 코드와 산출 파일만 신뢰하는 결과 타입 (SEAT-CONTRACT 실측 결론)
+ *   - stderr 존재를 실패로 해석하지 않음
+ */
+
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, delimiter } from 'node:path';
+
+export const isWin = process.platform === 'win32';
+
+const HOME = homedir();
+
+/**
+ * GUI 로 띄운 프로세스는 터미널 PATH 를 물려받지 못한다.
+ * 좌석 CLI 가 실제로 설치되는 위치를 직접 얹어준다.
+ * 경로는 SEAT-CONTRACT 실측에서 확인된 것들을 포함한다.
+ */
+export function extraDirs(): string[] {
+  const d: string[] = [];
+  if (isWin) {
+    if (process.env.APPDATA) d.push(join(process.env.APPDATA, 'npm'));
+    if (process.env.LOCALAPPDATA) {
+      d.push(join(process.env.LOCALAPPDATA, 'Programs', 'nodejs'));
+      d.push(join(process.env.LOCALAPPDATA, 'Programs', 'cursor', 'resources', 'app', 'bin'));
+    }
+    d.push(join(HOME, 'scoop', 'shims'));
+    d.push(join(HOME, 'scoop', 'apps', 'nodejs', 'current', 'bin'));
+  } else {
+    d.push('/usr/local/bin', '/opt/homebrew/bin');
+    d.push(join(HOME, '.npm-global', 'bin'));
+  }
+  // 두 플랫폼 공통 — claude 가 여기 설치된다 (실측: ~/.local/bin/claude.exe)
+  d.push(join(HOME, '.local', 'bin'));
+  return d.filter((p) => existsSync(p));
+}
+
+/**
+ * 자식 환경을 만든다.
+ * `extra` 의 값이 `undefined` 면 그 변수를 **삭제**한다.
+ * 이 규약이 API 키 제거(R1.1)의 구현 지점이다.
+ */
+export function envWithPath(extra: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
+  const PATH = [...extraDirs(), process.env.PATH ?? process.env.Path ?? ''].join(delimiter);
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH, ...extra };
+  if (isWin) env.Path = PATH;
+  for (const [k, v] of Object.entries(extra)) if (v === undefined) delete env[k];
+  return env;
+}
+
+/** Windows 셸은 인자를 알아서 인용해주지 않는다. 직접 한다. */
+export function quoteArg(arg: string): string {
+  if (arg.length > 0 && !/[\s"'`$&|<>^()[\]{};,*?!~#%=]/.test(arg)) return arg;
+  if (isWin) return `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, '$1$1')}"`;
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * 프로세스가 살아있는지 확인한다.
+ *
+ * signal 0 을 쓰지 않는다. POSIX 에서는 존재 확인이지만 Windows 에서는
+ * 대상 프로세스를 실제로 종료시킨다. `gate:liveness` 가 그 사용을 금지한다.
+ */
+export function isAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (isWin) {
+    const r = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], {
+      windowsHide: true,
+      encoding: 'utf8',
+    });
+    if (r.error || typeof r.stdout !== 'string') return false;
+    return r.stdout.includes(`"${pid}"`);
+  }
+  const r = spawnSync('ps', ['-p', String(pid)], { encoding: 'utf8' });
+  return r.status === 0;
+}
+
+/**
+ * 프로세스와 그 자손을 모두 종료한다.
+ *
+ * Windows 에 SIGKILL 이 없고, 좌석 CLI 는 셔틀(.ps1/.cmd) → node → 실제 CLI 로
+ * 손자까지 뻗는다. 부모만 죽이면 고아가 남아 쿼터를 계속 태운다 (R2.4).
+ */
+export function killTree(pid: number | undefined): void {
+  if (!pid) return;
+  if (isWin) {
+    spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGTERM');
+  } catch {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      /* 이미 죽었다 */
+    }
+  }
+}
+
+export interface RunOptions {
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+  input?: string;
+}
+
+export interface RunResult {
+  /** 판정의 유일한 근거. stderr 존재는 실패가 아니다 (SEAT-CONTRACT 실측). */
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  /** 타임아웃으로 강제 종료되었는가. */
+  timedOut: boolean;
+  ms: number;
+}
+
+/**
+ * 명령을 실행한다. 인자는 직접 인용하고 PATH 는 보강한다.
+ * 타임아웃 시 프로세스 트리를 정리한다.
+ */
+export function runCmd(name: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
+  const started = Date.now();
+  const line = [name, ...args].map(quoteArg).join(' ');
+
+  return new Promise<RunResult>((resolve) => {
+    const child = spawn(line, {
+      shell: true,
+      windowsHide: true,
+      cwd: opts.cwd ?? process.cwd(),
+      env: envWithPath(opts.env ?? {}),
+      detached: !isWin,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+
+    child.stdout?.on('data', (b: Buffer) => {
+      stdout += b.toString();
+    });
+    child.stderr?.on('data', (b: Buffer) => {
+      stderr += b.toString();
+    });
+
+    const timer =
+      opts.timeoutMs && opts.timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            killTree(child.pid);
+          }, opts.timeoutMs)
+        : undefined;
+
+    if (opts.input !== undefined) {
+      child.stdin?.write(opts.input);
+    }
+    child.stdin?.end();
+
+    const finish = (code: number | null): void => {
+      if (timer) clearTimeout(timer);
+      resolve({ code, stdout, stderr, timedOut, ms: Date.now() - started });
+    };
+
+    child.on('error', () => finish(null));
+    child.on('close', (code) => finish(code));
+  });
+}

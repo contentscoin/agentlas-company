@@ -15,13 +15,14 @@
   - [ ] 1.5 최종 운영 대상 미니PC에서 전 항목 재측정
   - _Requirements: R1, R2_
 
-- [ ] 2. 저장소 골격과 금지 게이트
-  - `vendor.lock`에 업스트림 4개 커밋 SHA 핀
-  - `proc.js`를 `@company/proc`으로 추출 (원저작 라이선스 고지 유지)
-  - 린트 3종을 CI 게이트로: `*_API_KEY` 0건, 위험 플래그 0건, `os.kill(pid,0)` 0건
-  - CI 매트릭스 windows-latest 1순위
-  - 시연: `npm test` 그린 + CI가 API 키 경로 없음을 증명
-  - _Requirements: R1.2, R1.3_
+- [x] 2. 저장소 골격과 금지 게이트
+  - [x] `vendor.lock`에 업스트림 4개 커밋 SHA 핀
+  - [x] `proc.js` → `src/proc` TypeScript 이식 (원저작 인용 유지, `isAlive` 추가)
+  - [x] 게이트 3종: `gate:apikey`, `gate:flags`, `gate:liveness` — 종료코드 0/1/2 규약
+  - [x] 키 이름은 정본 `src/seats/strip-env.ts` 에만 허용, 값 읽기는 어디서도 금지
+  - [x] CI 매트릭스 windows-latest 1순위 + 비밀 유출 방지 잡
+  - [x] 검증: 게이트 3종 PASS, `tsc` 0 오류, 22개 테스트 통과
+  - _Requirements: R1.1, R1.2, R1.3_
 
 - [ ] 3. 구역과 자격증명 레이아웃
   - Windows 계정 3분할(`owner` / `svc-seats` / `svc-broker`), `icacls` 적용 스크립트

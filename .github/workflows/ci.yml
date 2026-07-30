@@ -1,0 +1,67 @@
+name: CI
+
+# windows-latest 를 1순위로 둔다.
+# 운영 대상이 상시 Windows 미니PC 이고, 업스트림이 ubuntu 단독 CI 로
+# Windows 프로세스 함정 세 개를 놓친 전례가 있다.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: install
+        run: npm ci
+
+      # 게이트를 빌드보다 먼저 돌린다. 금지 경로가 들어왔다면
+      # 컴파일이 되는지보다 그 사실이 먼저 드러나야 한다.
+      - name: gate — API 키 경로 금지 (R1.2)
+        run: npm run gate:apikey
+
+      - name: gate — 권한 우회 플래그 금지 (R1.3)
+        run: npm run gate:flags
+
+      - name: gate — Windows 거짓말 프로세스 API 금지
+        run: npm run gate:liveness
+
+      - name: build
+        run: npm run build
+
+      - name: test
+        run: npm test
+
+  no-secrets:
+    name: 비밀 유출 방지
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # 운영 설정과 런타임 상태가 커밋되지 않았는지 확인한다.
+      # public 저장소이므로 이 게이트가 마지막 방어선이다.
+      - name: 추적되면 안 되는 경로 검사
+        shell: bash
+        run: |
+          forbidden=$(git ls-files | grep -E '^(policy\.yaml|devices\.json|credentials/|secrets/|browser-profiles/|ledger/|events\.jsonl)' || true)
+          if [ -n "$forbidden" ]; then
+            echo "추적되면 안 되는 파일이 커밋되었습니다:"
+            echo "$forbidden"
+            exit 1
+          fi
+          echo "PASS — 금지 경로 0건"
