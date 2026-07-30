@@ -1,0 +1,36 @@
+# 비밀·자격증명
+*.env
+.env*
+credentials/
+secrets/
+*.pem
+*.key
+
+# 운영 설정 (예시만 커밋)
+policy.yaml
+devices.json
+company.local.json
+
+# 런타임 상태
+ledger/
+events.jsonl
+runs/
+.work/
+SEAT-CONTRACT.local.md
+
+# 브라우저 프로필 (쿠키 확산 방지)
+browser-profiles/
+
+# 증거물
+artifacts/screenshots/
+artifacts/evidence/
+
+# 의존성·빌드
+node_modules/
+dist/
+build/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

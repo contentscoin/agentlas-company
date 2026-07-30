@@ -1,0 +1,26 @@
+# 업스트림 커밋 핀
+#
+# 네 개의 업스트림을 소스 복사(벤더링) 없이 커밋 핀으로 소비한다.
+# Task 2에서 실제 커밋 SHA로 채운다.
+# 값이 비어 있는 동안 런타임 코드를 추가하지 않는다.
+
+upstreams:
+  ai-company-discord:
+    repo: https://github.com/contentscoin/ai-company-discord
+    commit: ""
+    consumes: "회의 프로토콜(DECISION/VERDICT), companyctl --json 계약"
+  social-ai-team-custom:
+    repo: ""
+    commit: ""
+    consumes: "proc.js 프로세스 계층, 채널 실행, 브랜드 팩 규약"
+  agentlas-sei:
+    repo: https://github.com/contentscoin/agentlas-sei
+    commit: ""
+    consumes: "클레임/증거/모순 검증 엔진, digest 바인딩 리뷰"
+  Agentlas-OS:
+    repo: https://github.com/contentscoin/Agentlas-OS
+    commit: ""
+    consumes: "에이전트 패키지 build/borrow, Hub 차용"
+
+# 차용된 Hub 에이전트 패키지도 여기에 digest로 핀한다 (R13.2)
+borrowed_agents: []

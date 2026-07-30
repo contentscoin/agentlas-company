@@ -1,0 +1,62 @@
+# 자율성 등급 예시 (R4, R8)
+#
+# 실제 운영 파일은 policy.yaml 이며 .gitignore 로 제외된다.
+# 이 파일은 구조를 보여주기 위한 예시일 뿐 실제 계정·채널을 담지 않는다.
+
+levels:
+  L0:                       # 자동. 오너 개입 없음
+    - meeting
+    - plan
+    - draft
+    - analyze
+    - verify
+  L1:                       # 화이트리스트 자동발행
+    - publish.threads
+    - publish.naver_blog
+  L2:                       # 오너 승인
+    - publish.instagram
+    - publish.youtube
+    - publish.tiktok
+    - publish.wordpress
+    - store.write
+  L3:                       # 항상 승인 + 단계별 인증
+    - spend
+    - hire
+    - credential.change
+    - irreversible
+
+# 등급 승격 조건 (R4.4, R16.4)
+escalate_when:
+  - critic_verdict: BLOCK
+  - sei_risk_signal: true
+  - output_tainted: true
+
+# 승인 정책 (R4)
+approval:
+  card_ttl_minutes: 720           # 만료는 취소이며 통과가 아니다 (R4.7)
+  step_up_required_from: L3       # 기기 토큰 + 기기 잠금 해제 (R4.9)
+  notify_other_devices_from: L3   # (R4.10)
+  cooling_window_seconds: 120     # 비가역 작업 실행 전 중단 가능 구간 (R4.11)
+
+# 능력 스위치 (R8). 출하 시 전부 off, 재부팅 시 전부 off 복귀
+capabilities:
+  payout_account_change: { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  credential_change:     { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  product_delete:        { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  price_bulk_change:     { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  order_cancel_refund:   { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  post_bulk_delete:      { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  account_delete:        { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  dm_send:               { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  mass_follow:           { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+  spend:                 { enabled: false, expires_at: null, scope: { channels: [], accounts: [] } }
+
+# 서킷브레이커
+limits:
+  publish_per_channel_per_day: 3
+  actions_per_hour: 40
+  seat_daily_budget:
+    claude: 0                     # Task 1 실측 후 채운다
+    codex: 0
+    gemini: 1000                  # 공표치 (60/분, 1000/일)
+    cursor: 0
