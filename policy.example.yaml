@@ -55,8 +55,17 @@ capabilities:
 limits:
   publish_per_channel_per_day: 3
   actions_per_hour: 40
-  seat_daily_budget:
-    claude: 0                     # Task 1 실측 후 채운다
-    codex: 0
-    gemini: 1000                  # 공표치 (60/분, 1000/일)
-    cursor: 0
+  # 좌석 예산. SEAT-CONTRACT.md 실측값만 넣는다 (근거 없는 수치 금지)
+  # claude 는 주간 창이므로 일간 예산으로 표현되지 않는다
+  seat_budget:
+    claude:
+      window: week                # 실측: 주간 한도, 20:00 Asia/Seoul 리셋
+      limit: unknown
+    codex:
+      window: day
+      limit: unknown
+    gemini:
+      window: unknown             # 공표 1000/일은 개인 계정 기준이며 현재 계정에 미적용
+      limit: unknown
+    cursor:
+      window: unknown             # 에이전트 CLI 미설치

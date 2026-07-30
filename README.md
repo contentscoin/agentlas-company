@@ -52,17 +52,25 @@ Critic 좌석은 본체와 다른 벤더여야 한다. 의견 다양성을 프�
 
 ## 현재 상태
 
-**스펙 확정 단계. 런타임 코드는 없다.**
+**스펙 확정 + 좌석 1차 실측 완료. 런타임 코드는 아직 없다.**
 
-`SEAT-CONTRACT.md` 실측 — 4개 CLI의 비대화형 표면, 출력 형식, 동시성, 쿼터,
-세션 만료 증상 — 이 끝나기 전에는 런타임 코드를 추가하지 않는다.
-그 실측값이 좌석 브로커의 동시성과 예산 상수를 결정한다.
+Task 1 실측 결과 **가동 좌석 1/4**이다. codex만 동작하고, claude는 주간 한도 소진,
+gemini는 계정 구성 미비, cursor 에이전트 CLI는 미설치다. 자세한 값은
+`SEAT-CONTRACT.md` 참고. 이 문서가 좌석 브로커의 동시성·예산 상수를 결정한다.
+
+실측이 드러낸 것 중 설계를 바꾼 것 셋:
+
+- claude 쿼터는 **주간 창**이다. 일간 예산만으로는 표현되지 않는다
+- codex·gemini가 스킬·MCP를 기본 로드해 한 줄 프롬프트에 21k 토큰을 태웠다.
+  좌석은 최소 프로필로 격리해 띄워야 한다
+- 성공한 호출도 stderr에 경고를 낸다. 판정은 종료코드와 산출 파일로만 한다
 
 | 문서 | 내용 |
 |---|---|
 | `.kiro/specs/agentlas-company/requirements.md` | 요구사항 R1~R17과 수용 기준 |
 | `.kiro/specs/agentlas-company/design.md` | 구역, 좌석 브로커, 허용 동사, 능력 스위치, 원장 |
 | `.kiro/specs/agentlas-company/tasks.md` | 구현 태스크 17개 |
+| `SEAT-CONTRACT.md` | 좌석 CLI 실측 계약 (Task 1) |
 | `vendor.lock` | 업스트림 커밋 핀 |
 | `policy.example.yaml` | 자율성 등급과 능력 스위치 예시 |
 
