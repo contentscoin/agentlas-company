@@ -18,6 +18,9 @@ import { SeatBroker } from './seats/broker.js';
 import { ALL_SEATS, effectiveConcurrency } from './seats/spec.js';
 import { createProfile } from './seats/profile.js';
 import { resolveState } from './paths.js';
+import { CapabilityStore } from './capabilities/store.js';
+import { RISKY_CAPABILITIES, isRiskyCapability, type Caller } from './capabilities/types.js';
+import { humanRemaining, parseTtl } from './capabilities/ttl.js';
 
 const EXIT_OK = 0;
 const EXIT_FINDING = 1;
@@ -171,6 +174,123 @@ function cmdVerify(argv: string[]): number {
   return r.ok ? EXIT_OK : EXIT_FINDING;
 }
 
+function capStore(argv: string[]): CapabilityStore {
+  const ledger = Ledger.open(ledgerPath(argv));
+  const file = flagValue(argv, '--switches') ?? join(resolveState(), 'broker', 'capabilities.json');
+  return new CapabilityStore({
+    file,
+    ledger,
+    notify: (message) => out(`  알림 → 등록 기기 전체: ${message}`),
+  });
+}
+
+/**
+ * 오너 신원.
+ *
+ * CLI 의 `--step-up` 은 실물 단계별 인증의 자리표시자다.
+ * 진짜 인증(기기 토큰 + 기기 잠금 해제)은 Task 14 의 콘솔·PWA 가 맡는다.
+ * 지금 이것을 인증이라고 부르지 않는다.
+ */
+function ownerCaller(argv: string[]): Caller {
+  return {
+    zone: 'owner',
+    id: 'owner',
+    device: flagValue(argv, '--device') ?? 'cli',
+    stepUp: hasFlag(argv, '--step-up'),
+  };
+}
+
+/** 능력 스위치 (R8). */
+function cmdCaps(argv: string[]): number {
+  const sub = argv[1];
+  const store = capStore(argv);
+
+  if (sub === undefined || sub === 'list') {
+    const rows = store.view({ zone: 'owner', id: 'owner' });
+    if (hasFlag(argv, '--json')) {
+      jsonOut({ capabilities: rows });
+      return EXIT_OK;
+    }
+    out('능력                       상태   남은시간      범위                 사용  거부');
+    out('-'.repeat(80));
+    for (const r of rows) {
+      const scope =
+        r.scope.channels.length === 0 && r.scope.accounts.length === 0
+          ? '전체'
+          : [...r.scope.channels, ...r.scope.accounts].join(',');
+      out(
+        [
+          r.capability.padEnd(26),
+          (r.enabled ? 'ON' : 'off').padEnd(6),
+          humanRemaining(r.remainingMs).padEnd(13),
+          scope.padEnd(20),
+          String(r.recentUses).padEnd(5),
+          String(r.recentDenials),
+        ].join(''),
+      );
+    }
+    const on = rows.filter((r) => r.enabled).length;
+    out('');
+    out(on === 0 ? '켜진 위험 능력 없음 — 기본 차단 상태' : `켜진 위험 능력 ${on}종`);
+    return EXIT_OK;
+  }
+
+  if (sub === 'on') {
+    const cap = argv[2];
+    const ttlRaw = flagValue(argv, '--ttl');
+    if (!cap || !isRiskyCapability(cap)) {
+      process.stderr.write(`능력 이름이 필요합니다. 가능한 값:\n  ${RISKY_CAPABILITIES.join('\n  ')}\n`);
+      return EXIT_CANNOT_RUN;
+    }
+    if (!ttlRaw) {
+      process.stderr.write('--ttl 은 필수입니다 (예: --ttl 2h). 무기한 ON 은 만들 수 없습니다.\n');
+      return EXIT_CANNOT_RUN;
+    }
+    const ttlMs = parseTtl(ttlRaw);
+    if (ttlMs === null) {
+      process.stderr.write(`--ttl 형식 오류: ${ttlRaw} (예: 90s, 30m, 2h, 1d)\n`);
+      return EXIT_CANNOT_RUN;
+    }
+
+    const channels = flagValue(argv, '--channel')?.split(',') ?? [];
+    const accounts = flagValue(argv, '--account')?.split(',') ?? [];
+    const state = store.enable(ownerCaller(argv), {
+      capability: cap,
+      ttlMs,
+      scope: { channels, accounts },
+    });
+    if (hasFlag(argv, '--json')) jsonOut(state);
+    else {
+      out(`${cap} ON — 만료 ${state.expiresAt}`);
+      out('  스위치 ON 은 승인을 대체하지 않습니다. 개별 실행마다 L3 승인이 필요합니다.');
+      out('  재부팅하면 자동으로 OFF 로 돌아갑니다.');
+    }
+    return EXIT_OK;
+  }
+
+  if (sub === 'off') {
+    const cap = argv[2];
+    if (!cap || !isRiskyCapability(cap)) {
+      process.stderr.write('능력 이름이 필요합니다.\n');
+      return EXIT_CANNOT_RUN;
+    }
+    store.disable(ownerCaller(argv), cap);
+    out(`${cap} OFF`);
+    return EXIT_OK;
+  }
+
+  if (sub === 'panic') {
+    const reason = flagValue(argv, '--reason') ?? '오너 전체 차단';
+    store.panicDisableAll({ zone: 'owner', id: 'owner', device: flagValue(argv, '--device') ?? 'cli' }, reason);
+    out(`전체 차단 완료 — ${reason}`);
+    out('  진행 중 작업에 중단 신호를 보냈습니다.');
+    return EXIT_OK;
+  }
+
+  process.stderr.write(`알 수 없는 하위 명령: ${sub}\n`);
+  return EXIT_CANNOT_RUN;
+}
+
 function usage(): void {
   out('company — agentlas-company 오피스 CLI');
   out('');
@@ -179,7 +299,13 @@ function usage(): void {
   out('  company history [--kind K] [--run R] 원장 타임라인');
   out('  company verify                      원장 해시체인 검사');
   out('');
-  out('  공통: --json  --ledger <경로>');
+  out('  능력 스위치 (R8) — 위험한 능력은 기본으로 꺼져 있습니다');
+  out('  company caps                        현재 상태와 남은 시간');
+  out('  company caps on <능력> --ttl 2h --step-up [--channel c] [--account a]');
+  out('  company caps off <능력> --step-up');
+  out('  company caps panic [--reason 사유]   전체 차단 (인증 요구 없음)');
+  out('');
+  out('  공통: --json  --ledger <경로>  --switches <경로>');
 }
 
 async function main(): Promise<number> {
@@ -195,6 +321,8 @@ async function main(): Promise<number> {
         return cmdHistory(argv);
       case 'verify':
         return cmdVerify(argv);
+      case 'caps':
+        return cmdCaps(argv);
       case undefined:
       case '-h':
       case '--help':
