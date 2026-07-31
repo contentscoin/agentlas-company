@@ -21,6 +21,9 @@ import { resolveState } from './paths.js';
 import { CapabilityStore } from './capabilities/store.js';
 import { RISKY_CAPABILITIES, isRiskyCapability, type Caller } from './capabilities/types.js';
 import { humanRemaining, parseTtl } from './capabilities/ttl.js';
+import { classify, loadPolicy } from './policy/policy.js';
+import { ApprovalService } from './policy/approval.js';
+import type { Submitter } from './policy/types.js';
 
 const EXIT_OK = 0;
 const EXIT_FINDING = 1;
@@ -291,6 +294,134 @@ function cmdCaps(argv: string[]): number {
   return EXIT_CANNOT_RUN;
 }
 
+function policyFile(argv: string[]): string {
+  return flagValue(argv, '--policy') ?? join(resolveState(), 'policy.yaml');
+}
+
+function approvalService(argv: string[]): { svc: ApprovalService; source: 'file' | 'default' } {
+  const { policy, source } = loadPolicy(policyFile(argv));
+  const ledger = Ledger.open(ledgerPath(argv));
+  const svc = new ApprovalService({
+    policy,
+    ledger,
+    file: join(resolveState(), 'broker', 'approvals.json'),
+    notify: (devices, message) => out(`  알림 → [${devices.join(', ')}]: ${message}`),
+  });
+  return { svc, source };
+}
+
+function submitter(argv: string[]): Submitter {
+  return {
+    identity: flagValue(argv, '--as') ?? 'owner',
+    device: flagValue(argv, '--device') ?? 'cli',
+    stepUp: hasFlag(argv, '--step-up'),
+  };
+}
+
+/** 작업의 등급 판정을 보여준다 (R4.1 ~ R4.4). */
+function cmdClassify(argv: string[]): number {
+  const action = argv[1];
+  if (!action) {
+    process.stderr.write('사용법: company classify <작업> [--tainted] [--critic BLOCK] [--sei-risk]\n');
+    return EXIT_CANNOT_RUN;
+  }
+  const { policy, source } = loadPolicy(policyFile(argv));
+  const critic = flagValue(argv, '--critic');
+  const c = classify(policy, {
+    action,
+    ...(critic ? { criticVerdict: critic as 'BLOCK' | 'PASS' | 'CONCERN' } : {}),
+    ...(hasFlag(argv, '--sei-risk') ? { seiRisk: true } : {}),
+    ...(hasFlag(argv, '--tainted') ? { tainted: true } : {}),
+  });
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut({ policySource: source, ...c });
+    return EXIT_OK;
+  }
+  out(`작업        ${c.action}`);
+  out(`정책        ${source === 'file' ? policyFile(argv) : '기본 정책 (policy.yaml 없음)'}`);
+  out(`기본 등급   ${c.baseLevel}`);
+  out(`최종 등급   ${c.level}${c.escalatedBy.length > 0 ? `  ← 승격: ${c.escalatedBy.join(', ')}` : ''}`);
+  out(`승인 필요   ${c.needsApproval ? 'yes' : 'no'}`);
+  out(`단계별 인증 ${c.needsStepUp ? 'yes' : 'no'}`);
+  out(`비가역      ${c.irreversible ? 'yes (유예 창 적용)' : 'no'}`);
+  return EXIT_OK;
+}
+
+/** 승인 대기 목록과 결정 (R4). */
+function cmdApprovals(argv: string[]): number {
+  const sub = argv[1];
+  const { svc } = approvalService(argv);
+
+  if (sub === undefined || sub === 'list') {
+    const rows = svc.pending();
+    if (hasFlag(argv, '--json')) {
+      jsonOut({ pending: rows });
+      return EXIT_OK;
+    }
+    if (rows.length === 0) {
+      out('대기 중인 승인 없음');
+      return EXIT_OK;
+    }
+    for (const r of rows) {
+      out(`${r.id}  ${r.level}  ${r.action}${r.irreversible ? ' [비가역]' : ''}`);
+      out(`    ${r.summary}`);
+      out(`    만료 ${r.expiresAt}  digest ${r.payloadDigest.slice(0, 12)}`);
+    }
+    return EXIT_OK;
+  }
+
+  const id = argv[2];
+  if (!id) {
+    process.stderr.write('승인 요청 id 가 필요합니다.\n');
+    return EXIT_CANNOT_RUN;
+  }
+
+  if (sub === 'approve') {
+    const digest = flagValue(argv, '--digest');
+    if (!digest) {
+      process.stderr.write('--digest 는 필수입니다. 승인은 정확한 페이로드에 묶입니다.\n');
+      return EXIT_CANNOT_RUN;
+    }
+    const outcome = svc.approve(id, submitter(argv), digest);
+    if (!outcome.ok) {
+      process.stderr.write(`승인 실패: ${outcome.reason}\n`);
+      return EXIT_FINDING;
+    }
+    out(`승인 완료 — ${outcome.request.action}`);
+    const remaining = svc.coolingRemainingMs(id);
+    if (remaining !== null && remaining > 0) {
+      out(`  유예 창 ${Math.round(remaining / 1000)}초. 이 사이에 다른 기기에서 중단할 수 있습니다.`);
+      out(`  중단: company approvals abort ${id}`);
+    }
+    return EXIT_OK;
+  }
+
+  if (sub === 'reject') {
+    const outcome = svc.reject(id, submitter(argv), flagValue(argv, '--reason') ?? '오너 거부');
+    if (!outcome.ok) {
+      process.stderr.write(`거부 실패: ${outcome.reason}\n`);
+      return EXIT_FINDING;
+    }
+    out(`거부 완료 — ${outcome.request.action}`);
+    return EXIT_OK;
+  }
+
+  if (sub === 'abort') {
+    const s = submitter(argv);
+    const outcome = svc.abort(id, { identity: s.identity, device: s.device }, flagValue(argv, '--reason') ?? '유예 창 중단');
+    if (!outcome.ok) {
+      process.stderr.write(`중단 실패: ${outcome.reason}\n`);
+      return EXIT_FINDING;
+    }
+    out(`중단 완료 — ${outcome.request.action}`);
+    return EXIT_OK;
+  }
+
+  process.stderr.write(`알 수 없는 하위 명령: ${sub}\n`);
+  return EXIT_CANNOT_RUN;
+}
+
 function usage(): void {
   out('company — agentlas-company 오피스 CLI');
   out('');
@@ -305,7 +436,14 @@ function usage(): void {
   out('  company caps off <능력> --step-up');
   out('  company caps panic [--reason 사유]   전체 차단 (인증 요구 없음)');
   out('');
-  out('  공통: --json  --ledger <경로>  --switches <경로>');
+  out('  정책과 승인 (R4)');
+  out('  company classify <작업> [--tainted] [--critic BLOCK] [--sei-risk]');
+  out('  company approvals                   대기 중인 승인 카드');
+  out('  company approvals approve <id> --digest <d> --step-up --device phone-1');
+  out('  company approvals reject <id> [--reason 사유]');
+  out('  company approvals abort <id>        유예 창 안에서 중단');
+  out('');
+  out('  공통: --json  --ledger <경로>  --switches <경로>  --policy <경로>');
 }
 
 async function main(): Promise<number> {
@@ -323,6 +461,10 @@ async function main(): Promise<number> {
         return cmdVerify(argv);
       case 'caps':
         return cmdCaps(argv);
+      case 'classify':
+        return cmdClassify(argv);
+      case 'approvals':
+        return cmdApprovals(argv);
       case undefined:
       case '-h':
       case '--help':
