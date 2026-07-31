@@ -55,7 +55,7 @@
   - [ ] 5.1 예산 카운터 영속화 — 지금은 프로세스 메모리에만 있어 재시작 시 초기화된다
   - _Requirements: R1.1, R1.4, R2_
 
-- [ ] 6. 조직과 회의
+- [ ] 6. 조직과 회의  *(선행 조건 해소됨 — 벤더 2종 가동, 크로스벤더 라우팅 실측 확인)*
   - 페르소나 정의, 2라운드 턴제 회의 엔진, `DECISION`/`OPEN`/`ACTIONS` 마감 블록
   - `companyctl decision --json` 소비, 크로스벤더 강제, CRITICAL dissent 승격, War Room
   - 시연: `company meeting exec --agenda "..."` → Discord 스레드에 독립 발언 + 마감 블록

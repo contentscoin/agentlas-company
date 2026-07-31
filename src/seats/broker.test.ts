@@ -26,6 +26,7 @@ function fakeSeat(over: Partial<SeatSpec> & Pick<SeatSpec, 'id' | 'vendor'>): Se
     configHomeEnv: null,
     authFiles: [],
     promptVia: 'arg',
+    spawnMode: 'direct',
     buildArgs: (prompt, outFile) => [prompt, outFile],
     readResult: (file, stdout) => (file ?? stdout).trim() || null,
     quota: { window: 'day', limit: null, resetAt: null },

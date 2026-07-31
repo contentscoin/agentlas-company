@@ -59,6 +59,25 @@ export function envWithPath(extra: Record<string, string | undefined> = {}): Nod
   return env;
 }
 
+/**
+ * 실행 파일의 절대 경로를 찾는다. 없으면 null.
+ *
+ * 셸을 거치지 않는 직접 spawn 에 필요하다. Windows 에서 `shell: false` 는
+ * PATH 탐색과 확장자 보완을 해주지 않기 때문이다.
+ */
+export function resolveExecutable(bin: string): string | null {
+  const exts = isWin ? ['.exe', '.cmd', '.bat', ''] : [''];
+  const dirs = [...extraDirs(), ...(process.env.PATH ?? process.env.Path ?? '').split(delimiter)];
+  for (const dir of dirs) {
+    if (dir === '') continue;
+    for (const ext of exts) {
+      const candidate = join(dir, bin + ext);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
 /** Windows 셸은 인자를 알아서 인용해주지 않는다. 직접 한다. */
 export function quoteArg(arg: string): string {
   if (arg.length > 0 && !/[\s"'`$&|<>^()[\]{};,*?!~#%=]/.test(arg)) return arg;
@@ -150,12 +169,45 @@ export function runShell(commandLine: string, opts: RunOptions = {}): Promise<Ru
   return spawnLine(commandLine, opts);
 }
 
+/**
+ * 셸을 거치지 않고 직접 실행한다.
+ *
+ * 이 경로가 필요한 실측 근거: claude 좌석은 프롬프트를 인자로만 받는데
+ * (stdin 을 읽지 않는다) 여러 줄 인자는 cmd.exe 를 거치면 개행에서 깨진다.
+ * 셸을 빼면 인자가 CreateProcess 로 그대로 전달되어 개행도 길이도 문제가 없다.
+ *
+ * 대신 PATH 탐색을 우리가 해야 하므로 `resolveExecutable` 을 먼저 쓴다.
+ * `.ps1` 셔틀은 직접 실행할 수 없어 셸 경로를 쓴다.
+ */
+export function runDirect(bin: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
+  const resolved = resolveExecutable(bin);
+  if (resolved === null) {
+    return Promise.resolve({
+      code: null,
+      stdout: '',
+      stderr: `실행 파일을 찾지 못했다: ${bin}`,
+      timedOut: false,
+      ms: 0,
+    });
+  }
+  return spawnChild(resolved, args, false, opts);
+}
+
 function spawnLine(line: string, opts: RunOptions): Promise<RunResult> {
+  return spawnChild(line, undefined, true, opts);
+}
+
+function spawnChild(
+  target: string,
+  args: string[] | undefined,
+  useShell: boolean,
+  opts: RunOptions,
+): Promise<RunResult> {
   const started = Date.now();
 
   return new Promise<RunResult>((resolve) => {
-    const child = spawn(line, {
-      shell: true,
+    const child = spawn(target, args ?? [], {
+      shell: useShell,
       windowsHide: true,
       cwd: opts.cwd ?? process.cwd(),
       env: envWithPath(opts.env ?? {}),

@@ -11,36 +11,62 @@ Task 1 산출물. 좌석 CLI의 **실측** 계약. 추정값을 넣지 않는다
 
 | 좌석 | 설치 | OAuth | 비대화형 | 판정 |
 |---|---|---|---|---|
-| claude | 2.1.220 | 유효 | `-p` | **한도 소진** — 주간 한도, 20시(Asia/Seoul) 리셋 |
-| codex | codex-cli 0.144.1 | 유효 | `codex exec` | **동작** |
+| codex | codex-cli 0.144.1 | 유효 | `codex exec -` (stdin) | **동작** |
+| claude | 2.1.220 | 유효 | `claude -p "<본문>"` (인자·직접실행) | **동작** — 주간 한도 리셋 후 확인 |
 | gemini | 0.24.0 | 캐시된 자격증명 있음 | 위치 인자 | **구성 미비** — `GOOGLE_CLOUD_PROJECT` 필요 |
 | cursor | — | — | — | **미설치** — 에이전트 CLI 없음 |
 
-**현재 가동 좌석 1/4.**
+**현재 가동 좌석 2/4. 서로 다른 벤더 2종(openai, anthropic) → 크로스벤더 회의 가능.**
+
+이 문서 첫 판에는 "가동 좌석 1/4" 로 적혀 있었다. claude 가 주간 한도 소진
+상태였기 때문이다. 리셋 후 재측정해 동작을 확인했고, 그 과정에서 쿼터 창이
+실제로 주간이며 리셋 시각이 20:00 Asia/Seoul 임이 확증됐다.
 
 ## 좌석별 상세
 
 ### S1 claude (Claude Code 2.1.220)
 
 ```
-경로       C:\Users\USER\.local\bin\claude.exe
-호출       claude -p "<prompt>"
-출력형식   --output-format text | json | stream-json  (--print 전용)
-기타       --model, --permission-mode, --input-format
+경로       C:\Users\USER\.local\bin\claude.exe   (실행 파일 — 셔틀 아님)
+호출       claude -p "<prompt>" --output-format text
+           --strict-mcp-config --setting-sources project
+실행       셸 없이 직접 spawn. 여러 줄 인자를 전달하려면 필수
 ```
 
 | 항목 | 실측 |
 |---|---|
-| 성공 시 종료코드 | unknown (한도 소진으로 미측정) |
+| 성공 시 종료코드 | **0**, stdout 에 응답 단독 |
 | 한도 소진 시 종료코드 | **1** |
 | 한도 소진 시 출력 | `You've hit your weekly limit · resets 8pm (Asia/Seoul)` (stdout, 114 bytes) |
-| 쿼터 창 | **주간**. 일간이 아니다 |
+| 쿼터 창 | **주간**. 리셋 20:00 Asia/Seoul — 실제 리셋으로 확증 |
+| 지연 | 4,325 / 5,060 / 8,717 ms |
 | 최대 동시성 | unknown |
-| 지연 | unknown |
 
-**중요.** Max 구독의 한도가 주간 단위라는 것은 설계에 직접 영향을 준다.
-일일 예산만 관리하면 주중에 좌석 하나가 며칠씩 통째로 사라진다.
-`SeatSpec`에 주간 예산과 리셋 시각(로컬 타임존 포함)을 넣어야 한다.
+**stdin 을 읽지 않는다.** 파이프로 넣으면 출력이 0바이트이고 stderr 에
+`Warning: no stdin data received in 3s, proceeding without it` 이 나온다.
+즉 프롬프트는 인자로만 받는다. 그런데 여러 줄 인자는 `cmd.exe` 를 거치면
+개행에서 깨진다. 그래서 **셸을 우회한 직접 spawn** 이 필요하다 —
+`shell: false` 로 띄우면 인자가 CreateProcess 로 그대로 전달되어
+개행도 길이 상한도 문제가 없다. 여러 줄 프롬프트로 실측 확인했다.
+
+좌석마다 프롬프트 전달 경로가 다르다는 것이 이 문서의 핵심 발견 중 하나다.
+codex 는 셔틀(`.ps1`)이라 셸을 거쳐야 하고 stdin 을 읽는다.
+claude 는 실행 파일이라 직접 띄울 수 있고 인자만 읽는다.
+`SeatSpec` 에 `promptVia` 와 `spawnMode` 를 함께 둔 이유다.
+
+**최소 프로필 실측** (동일 프롬프트, 직접 spawn):
+
+| 플래그 | 지연 |
+|---|---|
+| 없음 | 13,122ms |
+| `--strict-mcp-config` | 11,860ms |
+| `--strict-mcp-config --setting-sources project` | **8,717ms** |
+
+사용자 전역 설정을 제외하면 33% 빨라진다. codex 와 달리 설정 홈 환경변수가
+아니라 플래그로 격리한다. 인증은 건드리지 않는다.
+
+**주간 창이 설계에 미치는 영향.** 일일 예산만 관리하면 주중에 좌석 하나가
+며칠씩 통째로 사라진다. `SeatSpec.quota` 에 창 종류와 리셋 시각을 담았다.
 
 ### S2 codex (codex-cli 0.144.1)
 
@@ -167,10 +193,14 @@ Cursor 에이전트 CLI를 별도 설치하고 OAuth 로그인해야 한다. 미
 
 ## 설계에 미치는 영향
 
-**1. 크로스벤더 회의가 지금은 불가능하다.**
-R3.4는 Critic이 본체와 다른 벤더 좌석에서 발언할 것을 요구한다. 가동 좌석이
-codex 하나뿐이라 이 조건을 만족할 수 없다. Task 6(회의)은 최소 2개 벤더가
-살아난 뒤에 착수해야 한다.
+**1. 크로스벤더 회의가 가능해졌다.**
+R3.4 는 Critic 이 본체와 다른 벤더 좌석에서 발언할 것을 요구한다. 처음 측정
+때는 가동 좌석이 codex 하나뿐이라 불가능했고 Task 6(회의)이 막혀 있었다.
+claude 한도 리셋 후 벤더가 둘(openai, anthropic)이 되어 교착이 풀렸다.
+
+실측 확인: `company ask --persona critic --forbid-vendor openai` →
+원장에 `critic → claude (5,060ms)`. 금지 벤더를 피해 다른 벤더로 라우팅된다.
+`company seats` 마지막 줄이 이 가능 여부를 항상 표시한다.
 
 **2. 프로필 격리는 쿼터가 아니라 재현성 요구다.**
 격리의 토큰 절감폭은 8%뿐이다. 진짜 이유는 개인 설정이 좌석의 모델과 추론 강도를
@@ -191,50 +221,36 @@ stderr가 `NativeCommandError`로 승격되어 호출자를 오도한다. 브로
 codex와 gemini가 `.ps1` 셔틀이다. `proc.js`의 Windows 인용 처리가 필요한 이유가
 여기서 실측으로 확인됐다.
 
-### S5 ollama (로컬 모델 좌석)
+## 검토 후 제외한 경로
 
-오너 요청("오픈코덱스로 다양한 프로바이더")을 제약 안에서 구현한 결과다.
-멀티프로바이더 포크·프록시·게이트웨이는 대부분 OpenRouter·DeepSeek 등의
-**API 키**로 붙어 R1 에 걸린다. 키 없이 벤더를 늘리는 유일한 두 갈래가
-OAuth 로컬 CLI 와 **로컬 모델**이다.
+### 멀티프로바이더 포크·프록시 (API 키 경로)
 
-```
-설치      ollama 0.1.34 (2024-05-07 설치본)
-GPU       GTX 1660 SUPER 6GB, 시스템 RAM 32GB
-호출      ollama run <모델>   프롬프트는 stdin 또는 인자
-```
+`ymichael/open-codex`, `opencodex.me` / `lidge-jun/opencodex` 프록시,
+`just-every/code`, AI 게이트웨이 방식을 검토했다. 이들의 "다양한 프로바이더"는
+대부분 OpenRouter·DeepSeek 등의 **API 키**로 붙어 R1 과 정면 충돌한다.
 
-| 항목 | 실측 |
-|---|---|
-| `/api/tags` | 200, 모델 2종 인식 |
-| `/api/ps` | **404** — 이 버전에 없는 엔드포인트 |
-| `/api/generate` | **타임아웃** (16분 46초 후 500) |
-| `ollama run` (stdin) | exit 1, 출력 0바이트 |
-| `ollama run` (인자) | 10분 초과, 응답 없음 |
+이 조사 과정에서 우리 게이트의 구멍을 찾았다. `OPENROUTER_API_KEY` 를 소스에
+넣고 `gate:apikey` 를 돌렸더니 **통과했다** — 벤더 이름을 열거형으로 나열했고
+목록에 없는 벤더였기 때문이다. 프로바이더는 계속 늘어나므로 허용목록 방식은
+언젠가 반드시 뚫린다. `<대문자>_API_KEY` 패턴 전체를 막도록 고쳤다.
 
-**근본 원인 (server.log).**
+### 로컬 모델 (ollama)
 
-```
-llama_model_load: error loading model:
-  done_getting_tensors: wrong number of tensors; expected 147, got 146
-error loading llama server: timed out waiting for llama runner to start
-```
+키 없이 벤더를 늘리는 대안으로 검토했고 **오너 판단으로 제외했다.**
 
-설치된 런타임이 2년 이상 오래돼서 llama3.2 아키텍처를 로드하지 못한다.
-런너 디렉터리도 `cuda_v11.3` 세대다. 기존 `llama3:latest` 는 blob 이
-사라져 이미 깨져 있었다.
+참고용으로 실측 결과만 남긴다. 설치된 ollama 0.1.34(2024-05-07)가
+llama3.2 아키텍처를 로드하지 못했다 — `done_getting_tensors: wrong number of
+tensors; expected 147, got 146`. `/api/generate` 는 16분 46초 후 500,
+`ollama run` 은 10분 초과. 런타임 업그레이드가 필요한 상태였다.
 
-**판정: 로컬 좌석은 코드는 완성됐고 런타임이 막고 있다.**
-`verified: false` 로 두고 사유를 기록한다. 해결 경로 둘.
+`AuthMode` 에서 `local` 을 제거해 등록부에는 `oauth` 만 남았다.
+다시 필요해지면 방식을 더하고 항목을 추가하면 된다.
 
-1. Ollama 를 최신으로 업그레이드 — 기존 설치 앱을 교체하므로 오너 확인 필요
-2. 0.1.34 가 지원하는 세대 모델을 받기 — `llama3:latest` 재수신(4.7GB).
-   8B 를 6GB VRAM 에 부분 오프로드하므로 응답이 느릴 수 있다
+### 크로스벤더 교착은 다르게 풀렸다
 
-**이 좌석이 왜 중요한가.** 제약 준수가 아니라 **교착 해소** 때문이다.
-지금 검증된 좌석이 codex 하나뿐이라 R3.4(Critic 은 다른 벤더)를 만족할 수
-없어 회의(Task 6)가 막혀 있다. 로컬 좌석은 벤더가 다르고 쿼터가 없어
-그 교착을 푼다. `company seats` 가 이 상태를 마지막 줄에 명시한다.
+로컬 좌석의 목적은 R3.4(Critic 은 본체와 다른 벤더) 교착 해소였다.
+그런데 claude 의 주간 한도가 리셋되어 **두 번째 벤더가 그냥 열렸다.**
+로컬 모델 없이 교착이 풀렸으므로 그 경로는 필요하지 않다.
 
 ## 미측정 항목 (다음 측정 대상)
 

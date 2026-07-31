@@ -34,6 +34,7 @@ function fakeSeat(id: string, vendor: string): SeatSpec {
     configHomeEnv: null,
     authFiles: [],
     promptVia: 'arg',
+    spawnMode: 'direct',
     buildArgs: (prompt, outFile) => [prompt, outFile],
     readResult: (file, stdout) => (file ?? stdout).trim() || null,
     quota: { window: 'day', limit: null, resetAt: null },

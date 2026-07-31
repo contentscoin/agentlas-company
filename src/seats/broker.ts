@@ -13,7 +13,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { runCmd, type RunResult } from '../proc/index.js';
+import { runCmd, runDirect, type RunResult } from '../proc/index.js';
 import { Ledger, digestPayload } from '../ledger/ledger.js';
 import type { SeatId } from '../ledger/types.js';
 import type { BuiltPack } from '../taint/types.js';
@@ -84,13 +84,17 @@ interface SeatState {
  * exit 1 이 된다. Windows 명령줄 길이 상한(약 8191자)도 컨텍스트 팩을
  * 인자로 실을 수 없게 만든다.
  */
-const defaultRunner: SeatRunner = (spec, args, profile, timeoutMs, prompt) =>
-  runCmd(spec.bin, args, {
+const defaultRunner: SeatRunner = (spec, args, profile, timeoutMs, prompt) => {
+  const opts = {
     cwd: profile.workDir,
     env: profile.env,
     timeoutMs,
     ...(spec.promptVia === 'stdin' ? { input: prompt } : {}),
-  });
+  };
+  // `.ps1`/`.cmd` 셔틀은 셸로, 실행 파일은 직접 띄운다.
+  // 직접 실행은 인자에 개행이 들어가도 깨지지 않는다 (claude 가 이 경로를 쓴다).
+  return spec.spawnMode === 'direct' ? runDirect(spec.bin, args, opts) : runCmd(spec.bin, args, opts);
+};
 
 export class SeatBroker {
   private readonly ledger: Ledger;

@@ -80,6 +80,36 @@ export function createProfile(spec: SeatSpec): SeatProfile {
     workDir,
     env,
     isolated,
-    dispose: () => rmSync(root, { recursive: true, force: true }),
+    dispose: () => disposeQuietly(root),
   };
+}
+
+/**
+ * 정리에 실패한 프로필 경로. 진단 명령이 읽는다.
+ *
+ * 조용히 흘리지 않으려고 목록으로 남긴다. 다만 정리 실패로 예외를 던지지는
+ * 않는다 — 실제로 겪은 일이 근거다. claude 좌석이 답을 정상적으로 돌려준 뒤
+ * 임시 디렉터리 삭제가 EPERM 으로 실패했고, `finally` 의 그 예외가 성공한
+ * 호출을 "실행 불가" 로 뒤집었다. 성공을 실패로 바꾸는 정리는 정리가 아니다.
+ */
+export const leakedProfiles: string[] = [];
+
+function disposeQuietly(root: string): void {
+  // 좌석 프로세스가 작업 디렉터리 핸들을 늦게 놓는 경우가 있어 짧게 재시도한다.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch {
+      if (attempt < 2) sleepBriefly(60);
+    }
+  }
+  leakedProfiles.push(root);
+}
+
+function sleepBriefly(ms: number): void {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    /* 동기 대기 — dispose 는 동기 API 다 */
+  }
 }

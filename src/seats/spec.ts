@@ -7,15 +7,20 @@
  */
 
 import type { SeatId } from '../ledger/types.js';
-import { ollamaSeat } from './providers.js';
+
+export type Vendor = 'anthropic' | 'openai' | 'google' | 'cursor';
 
 /**
- * 벤더 계열.
+ * 프로세스 실행 방식. 실측이 강제한 구분이다.
  *
- * `local` 은 기계 안에서 도는 모델이다. 다른 벤더와 모델 계열이 달라
- * Critic 의 교차 비평(R3.4)에 쓸 수 있고, 계정이 없으니 쿼터도 없다.
+ *   shell   `.ps1`/`.cmd` 셔틀을 거치는 좌석 (codex, gemini). 프롬프트는 stdin.
+ *   direct  실행 파일을 셸 없이 직접 띄운다 (claude).
+ *
+ * claude 는 프롬프트를 인자로만 받고 stdin 을 읽지 않는데, 여러 줄 인자는
+ * cmd.exe 를 거치면 개행에서 깨진다. 셸을 빼면 인자가 CreateProcess 로
+ * 그대로 전달되어 개행도 길이도 문제가 없다.
  */
-export type Vendor = 'anthropic' | 'openai' | 'google' | 'cursor' | 'local';
+export type SpawnMode = 'shell' | 'direct';
 
 /** 쿼터 창. claude 는 주간이고 codex 는 일간이다 (실측). */
 export interface QuotaWindow {
@@ -47,6 +52,13 @@ export interface SeatSpec {
    * 약 8191자라 컨텍스트 팩을 인자로는 실을 수 없다.
    */
   promptVia: 'arg' | 'stdin';
+  /**
+   * 프로세스 실행 방식.
+   *
+   * `.ps1`/`.cmd` 셔틀은 직접 실행할 수 없어 `shell` 이어야 한다.
+   * stdin 을 읽지 않는 좌석은 `direct` + `arg` 로 셸을 우회해야 여러 줄이 전달된다.
+   */
+  spawnMode: SpawnMode;
   /**
    * 인자 배열을 만든다.
    * `promptVia: 'stdin'` 이면 `prompt` 는 빈 문자열로 들어오고 본문은 stdin 으로 간다.
@@ -94,6 +106,8 @@ export const CODEX_SEAT: SeatSpec = {
   // as an argument (or if `-` is used), instructions are read from stdin").
   // 여러 줄 프롬프트로 실측 확인했다.
   promptVia: 'stdin',
+  // `.ps1` 셔틀이라 셸을 거쳐야 한다.
+  spawnMode: 'shell',
   buildArgs: (_prompt, outFile) => [
     'exec',
     '-',
@@ -111,28 +125,52 @@ export const CODEX_SEAT: SeatSpec = {
 };
 
 /**
- * claude — 표면은 확인됐으나 주간 한도 소진으로 성공 경로 미측정.
+ * claude — 주간 한도 리셋 후 실측 확인.
  *
- * 실측: claude -p "<prompt>" → EXIT=1,
- * "You've hit your weekly limit · resets 8pm (Asia/Seoul)"
+ * 실측 경과:
+ *   1차(한도 소진)  claude -p "<prompt>" → EXIT=1,
+ *                   "You've hit your weekly limit · resets 8pm (Asia/Seoul)"
+ *   2차(리셋 후)    같은 명령 → EXIT=0, "SEAT_OK". 쿼터 창이 주간이고
+ *                   리셋 시각이 실제로 20:00 Asia/Seoul 임을 확인했다.
  *
- * 성공 시 종료 코드와 출력 스키마, 설정 격리 수단은 아직 모른다.
+ * stdin 은 읽지 않는다. 파이프로 넣으면 출력이 0바이트이고, stderr 에
+ * "Warning: no stdin data received in 3s, proceeding without it" 이 나온다.
+ * 즉 프롬프트는 인자로만 받으며, 여러 줄 인자는 셸을 거치면 깨지므로
+ * `direct` 실행으로 셸을 우회한다.
+ *
+ * 최소 프로필 실측 (동일 프롬프트):
+ *   플래그 없음                                13,122ms
+ *   --strict-mcp-config                        11,860ms
+ *   --strict-mcp-config --setting-sources project  8,717ms
+ *
+ * 사용자 설정을 제외하면 33% 빨라진다. 격리의 이유는 속도가 아니라
+ * 재현성이지만(codex 에서 확인) 여기서는 속도까지 얻는다.
  */
 export const CLAUDE_SEAT: SeatSpec = {
   id: 'claude',
   vendor: 'anthropic',
   bin: 'claude',
+  // 설정 홈 환경변수 대신 플래그로 격리한다. 인증은 건드리지 않는다.
   configHomeEnv: null,
   authFiles: [],
-  // stdin 으로 가정한다. `claude -p` 가 파이프 입력을 읽는지는 미측정이므로
-  // 주간 한도가 풀린 뒤 확인해야 한다.
-  promptVia: 'stdin',
-  buildArgs: () => ['-p', '--output-format', 'text'],
+  promptVia: 'arg',
+  spawnMode: 'direct',
+  buildArgs: (prompt) => [
+    '-p',
+    prompt,
+    '--output-format',
+    'text',
+    // 개인 MCP 서버를 상속하지 않는다.
+    '--strict-mcp-config',
+    // 사용자 전역 설정을 제외한다. 좌석의 모델과 동작이 오너의 에디터 설정에
+    // 따라 조용히 바뀌는 것을 막는다.
+    '--setting-sources',
+    'project',
+  ],
   readResult: (_outFileContent, stdout) => trimmed(stdout),
   quota: { window: 'week', limit: null, resetAt: '20:00 Asia/Seoul' },
   maxConcurrent: null,
-  verified: false,
-  note: '주간 한도 소진으로 성공 경로 미측정. 설정 격리 수단과 stdin 입력 미확인.',
+  verified: true,
 };
 
 /**
@@ -153,6 +191,7 @@ export const GEMINI_SEAT: SeatSpec = {
   // Gemini CLI 도움말: "-p, --prompt  Prompt. Appended to input on stdin (if any)."
   // stdin 입력을 받는다고 적혀 있으나 계정 구성 미비로 실측하지 못했다.
   promptVia: 'stdin',
+  spawnMode: 'shell',
   buildArgs: () => ['-o', 'text'],
   readResult: (_outFileContent, stdout) => trimmed(stdout),
   quota: { window: 'unknown', limit: null, resetAt: null },
@@ -175,6 +214,7 @@ export const CURSOR_SEAT: SeatSpec = {
   configHomeEnv: null,
   authFiles: [],
   promptVia: 'stdin',
+  spawnMode: 'shell',
   buildArgs: () => ['-p'],
   readResult: (_outFileContent, stdout) => trimmed(stdout),
   quota: { window: 'unknown', limit: null, resetAt: null },
@@ -183,21 +223,7 @@ export const CURSOR_SEAT: SeatSpec = {
   note: '에이전트 CLI 미설치. Cloud Agents API 는 R1.5 로 금지.',
 };
 
-/**
- * 로컬 모델 이름. 환경변수로 바꿀 수 있다.
- *
- * 기본값을 작은 모델로 둔 이유는 미니PC 에서 좌석 4개와 브라우저 자동화가
- * 함께 도는데 큰 모델이 메모리를 독점하면 회사가 멈추기 때문이다.
- */
-export const OLLAMA_MODEL = process.env.AGENTLAS_OLLAMA_MODEL ?? 'llama3.2:1b';
-
-export const ALL_SEATS: readonly SeatSpec[] = [
-  CODEX_SEAT,
-  CLAUDE_SEAT,
-  GEMINI_SEAT,
-  CURSOR_SEAT,
-  ollamaSeat(OLLAMA_MODEL),
-];
+export const ALL_SEATS: readonly SeatSpec[] = [CODEX_SEAT, CLAUDE_SEAT, GEMINI_SEAT, CURSOR_SEAT];
 
 export function seatById(id: SeatId): SeatSpec {
   const found = ALL_SEATS.find((s) => s.id === id);
