@@ -115,6 +115,7 @@ export interface ConsumeOutcome {
   reason?:
     | 'not-found'
     | 'not-approved'
+    | 'rejected'
     | 'expired'
     | 'aborted'
     | 'digest-mismatch'

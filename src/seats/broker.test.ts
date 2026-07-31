@@ -25,6 +25,7 @@ function fakeSeat(over: Partial<SeatSpec> & Pick<SeatSpec, 'id' | 'vendor'>): Se
     bin: 'fake',
     configHomeEnv: null,
     authFiles: [],
+    promptVia: 'arg',
     buildArgs: (prompt, outFile) => [prompt, outFile],
     readResult: (file, stdout) => (file ?? stdout).trim() || null,
     quota: { window: 'day', limit: null, resetAt: null },
@@ -257,6 +258,45 @@ describe('원장 기록과 오염 전파', () => {
     await broker.ask({ persona: 'a', prompt: 'q' });
     await broker.ask({ persona: 'b', prompt: 'q' });
     expect(ledger.verify().ok).toBe(true);
+  });
+});
+
+describe('프롬프트 전달 경로', () => {
+  it('stdin 좌석은 프롬프트를 인자에 심지 않는다', async () => {
+    let seenArgs: string[] = [];
+    let seenPrompt = '';
+    const broker = new SeatBroker({
+      ledger,
+      seats: [fakeSeat({ id: 'codex', vendor: 'openai', promptVia: 'stdin', buildArgs: (_p, out) => ['-', out] })],
+      runner: async (_spec, args, _profile, _timeout, prompt) => {
+        seenArgs = args;
+        seenPrompt = prompt;
+        writeFileSync(args[1]!, 'ok', 'utf8');
+        return ok();
+      },
+    });
+
+    const multiline = '첫 줄\n\n두 번째 줄\n세 번째 줄';
+    const r = await broker.ask({ persona: 'ceo', prompt: multiline });
+    expect(r.ok).toBe(true);
+    expect(seenArgs[0]).toBe('-');
+    expect(seenArgs.join(' ')).not.toContain('첫 줄');
+    expect(seenPrompt).toBe(multiline);
+  });
+
+  it('arg 좌석은 프롬프트를 인자로 받는다', async () => {
+    let seenArgs: string[] = [];
+    const broker = new SeatBroker({
+      ledger,
+      seats: [fakeSeat({ id: 'codex', vendor: 'openai', promptVia: 'arg' })],
+      runner: async (_spec, args) => {
+        seenArgs = args;
+        writeFileSync(args[1]!, 'ok', 'utf8');
+        return ok();
+      },
+    });
+    await broker.ask({ persona: 'ceo', prompt: '질문' });
+    expect(seenArgs[0]).toBe('질문');
   });
 });
 

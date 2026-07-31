@@ -56,6 +56,8 @@ export type SeatRunner = (
   args: string[],
   profile: SeatProfile,
   timeoutMs: number,
+  /** 프롬프트 본문. `promptVia: 'stdin'` 인 좌석은 이것을 stdin 으로 보낸다. */
+  prompt: string,
 ) => Promise<RunResult>;
 
 export interface BrokerOptions {
@@ -74,8 +76,21 @@ interface SeatState {
   exhausted: boolean;
 }
 
-const defaultRunner: SeatRunner = (spec, args, profile, timeoutMs) =>
-  runCmd(spec.bin, args, { cwd: profile.workDir, env: profile.env, timeoutMs });
+/**
+ * 기본 실행기.
+ *
+ * `promptVia: 'stdin'` 이면 프롬프트를 stdin 으로 보낸다.
+ * 실측 근거: 여러 줄 프롬프트를 셸 인자로 넘기면 개행이 명령줄을 깨뜨려
+ * exit 1 이 된다. Windows 명령줄 길이 상한(약 8191자)도 컨텍스트 팩을
+ * 인자로 실을 수 없게 만든다.
+ */
+const defaultRunner: SeatRunner = (spec, args, profile, timeoutMs, prompt) =>
+  runCmd(spec.bin, args, {
+    cwd: profile.workDir,
+    env: profile.env,
+    timeoutMs,
+    ...(spec.promptVia === 'stdin' ? { input: prompt } : {}),
+  });
 
 export class SeatBroker {
   private readonly ledger: Ledger;
@@ -205,8 +220,9 @@ export class SeatBroker {
       try {
         state.used++;
         const outFile = join(profile.workDir, 'seat-out.txt');
-        const args = spec.buildArgs(req.prompt, outFile);
-        const run = await this.runner(spec, args, profile, timeoutMs);
+        // stdin 좌석에는 프롬프트를 인자로 심지 않는다.
+        const args = spec.buildArgs(spec.promptVia === 'stdin' ? '' : req.prompt, outFile);
+        const run = await this.runner(spec, args, profile, timeoutMs, req.prompt);
 
         // 판정은 종료 코드와 산출물로만. stderr 는 보지 않는다.
         const fileContent = existsSync(outFile) ? readFileSync(outFile, 'utf8') : null;

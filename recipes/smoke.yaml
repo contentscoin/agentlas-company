@@ -1,0 +1,32 @@
+# 스모크 레시피
+#
+# 엔진이 실제 좌석·게이트·승인을 관통하는지 확인하는 최소 단위.
+# 좌석 호출 1회의 하한이 약 19.4k 토큰이라 스텝을 하나로 줄였다.
+#
+# 주간 사이클 전체를 스모크로 쓰지 않는 이유: 좌석 스텝이 4개라
+# 매번 78k 토큰을 태우고, 지금은 검증된 벤더가 하나뿐이라
+# critic 스텝의 크로스벤더 조건을 만족할 수 없어 어차피 중간에 멈춘다.
+
+name: smoke
+description: 좌석 1회 + 결정론적 게이트 + 승인 판정
+
+steps:
+  - id: draft
+    kind: seat
+    title: 한 줄 산출물
+    persona: studio
+    produce: draft
+    instruction: |
+      Reply with exactly one line of Korean marketing copy for a moisturizer.
+      No links, no numbers, no claims that need a source.
+
+  - id: shape-gate
+    kind: gate
+    title: 산출물 존재 확인
+    command: node -e "process.exit(0)"
+
+  - id: publish-approval
+    kind: approval
+    title: 발행 승인 판정
+    action: publish.threads
+    subject: draft

@@ -24,6 +24,9 @@ import { humanRemaining, parseTtl } from './capabilities/ttl.js';
 import { classify, loadPolicy } from './policy/policy.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
+import { RecipeEngine } from './recipes/engine.js';
+import { loadRecipe } from './recipes/load.js';
+import { currentPlatform, emitForPlatform, parseSchedule } from './recipes/schedule.js';
 
 const EXIT_OK = 0;
 const EXIT_FINDING = 1;
@@ -294,6 +297,109 @@ function cmdCaps(argv: string[]): number {
   return EXIT_CANNOT_RUN;
 }
 
+/** 레시피 실행에 필요한 것을 한 번에 조립한다. */
+function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalService } {
+  const { policy } = loadPolicy(policyFile(argv));
+  const ledger = Ledger.open(ledgerPath(argv));
+  const broker = new SeatBroker({ ledger });
+  const approvals = new ApprovalService({
+    policy,
+    ledger,
+    file: join(resolveState(), 'broker', 'approvals.json'),
+    notify: (devices, message) => out(`  알림 → [${devices.join(', ')}]: ${message}`),
+  });
+  const engine = new RecipeEngine({ ledger, broker, approvals, policy, stateDir: resolveState() });
+  return { engine, approvals };
+}
+
+/** 레시피를 실행한다 (R12). */
+async function cmdRun(argv: string[]): Promise<number> {
+  const file = argv[1];
+  if (!file) {
+    process.stderr.write('사용법: company run <레시피.yaml> [--resume <runId>]\n');
+    return EXIT_CANNOT_RUN;
+  }
+
+  let recipe;
+  try {
+    recipe = loadRecipe(file);
+  } catch (err) {
+    process.stderr.write(`${(err as Error).message}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const { engine } = engineFor(argv);
+  const resumeId = flagValue(argv, '--resume');
+  const outcome = resumeId ? await engine.resume(recipe, resumeId) : await engine.start(recipe);
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut(outcome);
+  } else {
+    out(`${recipe.name} → ${outcome.status}  (run ${outcome.runId})`);
+    if (outcome.stoppedAt) out(`  멈춘 지점: ${outcome.stoppedAt}`);
+    if (outcome.reason) out(`  사유: ${outcome.reason}`);
+    const state = engine.loadRun(outcome.runId);
+    for (const s of state?.steps ?? []) {
+      out(`  ${s.status.padEnd(18)} ${s.id}${s.detail ? `  ${s.detail}` : ''}`);
+    }
+    if (outcome.status === 'paused') {
+      out('');
+      out(`  승인 후 이어서: company run ${file} --resume ${outcome.runId}`);
+    }
+  }
+  return outcome.status === 'completed' || outcome.status === 'paused' ? EXIT_OK : EXIT_FINDING;
+}
+
+/** 상시 기동 등록 명령문을 출력한다. 실제 등록은 오너가 실행한다 (R12.6). */
+function cmdSchedule(argv: string[]): number {
+  const file = argv[1];
+  if (!file) {
+    process.stderr.write('사용법: company schedule <레시피.yaml> [--user svc-broker]\n');
+    return EXIT_CANNOT_RUN;
+  }
+
+  let recipe;
+  try {
+    recipe = loadRecipe(file);
+  } catch (err) {
+    process.stderr.write(`${(err as Error).message}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+  if (!recipe.schedule) {
+    process.stderr.write(`${recipe.name} 에 schedule 이 없습니다.\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const parsed = parseSchedule(recipe.schedule);
+  if (!parsed) {
+    process.stderr.write(`schedule 형식 오류: ${recipe.schedule} (예: 'MON 09:00')\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const platform = currentPlatform();
+  const user = flagValue(argv, '--user');
+  const spec = {
+    name: `agentlas-${recipe.name}`,
+    command: `company run ${file}`,
+    at: parsed.at,
+    ...(parsed.weekday ? { weekday: parsed.weekday } : {}),
+    ...(user ? { user } : {}),
+    workingDir: process.cwd(),
+  };
+
+  const emitted = emitForPlatform(platform, spec);
+  if (hasFlag(argv, '--json')) {
+    jsonOut({ platform, spec, emitted });
+    return EXIT_OK;
+  }
+  out(`플랫폼 ${platform} · ${recipe.name} · ${recipe.schedule}`);
+  out('');
+  out('아래를 직접 실행해 등록하세요. 시스템 스케줄러 변경은 코드가 조용히 하지 않습니다.');
+  out('');
+  out(emitted);
+  return EXIT_OK;
+}
+
 function policyFile(argv: string[]): string {
   return flagValue(argv, '--policy') ?? join(resolveState(), 'policy.yaml');
 }
@@ -443,6 +549,11 @@ function usage(): void {
   out('  company approvals reject <id> [--reason 사유]');
   out('  company approvals abort <id>        유예 창 안에서 중단');
   out('');
+  out('  반복 업무 (R12)');
+  out('  company run <레시피.yaml>            레시피 실행');
+  out('  company run <레시피.yaml> --resume <runId>   멈춘 지점부터 재개');
+  out('  company schedule <레시피.yaml>       상시 기동 등록 명령문 출력');
+  out('');
   out('  공통: --json  --ledger <경로>  --switches <경로>  --policy <경로>');
 }
 
@@ -465,6 +576,10 @@ async function main(): Promise<number> {
         return cmdClassify(argv);
       case 'approvals':
         return cmdApprovals(argv);
+      case 'run':
+        return await cmdRun(argv);
+      case 'schedule':
+        return cmdSchedule(argv);
       case undefined:
       case '-h':
       case '--help':

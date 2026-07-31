@@ -32,7 +32,18 @@ export interface SeatSpec {
   configHomeEnv: string | null;
   /** 격리 디렉터리로 복사할 인증 파일 이름들. OAuth 세션을 유지하는 최소 집합. */
   authFiles: string[];
-  /** 프롬프트와 출력 파일을 받아 인자 배열을 만든다. */
+  /**
+   * 프롬프트를 어떻게 넘기는가.
+   *
+   * `stdin` 이 기본이어야 한다. 실측 근거: 여러 줄 프롬프트를 셸 인자로 넘기면
+   * 개행이 명령줄을 깨뜨려 exit 1 이 된다. 그리고 Windows 명령줄 길이 상한이
+   * 약 8191자라 컨텍스트 팩을 인자로는 실을 수 없다.
+   */
+  promptVia: 'arg' | 'stdin';
+  /**
+   * 인자 배열을 만든다.
+   * `promptVia: 'stdin'` 이면 `prompt` 는 빈 문자열로 들어오고 본문은 stdin 으로 간다.
+   */
   buildArgs: (prompt: string, outFile: string) => string[];
   /**
    * 결과를 읽는다. 종료 코드 0 이어도 이 함수가 null 을 주면 실패로 본다.
@@ -72,9 +83,13 @@ export const CODEX_SEAT: SeatSpec = {
   bin: 'codex',
   configHomeEnv: 'CODEX_HOME',
   authFiles: ['auth.json'],
-  buildArgs: (prompt, outFile) => [
+  // `codex exec -` 는 지시문을 stdin 에서 읽는다 (자체 도움말: "If not provided
+  // as an argument (or if `-` is used), instructions are read from stdin").
+  // 여러 줄 프롬프트로 실측 확인했다.
+  promptVia: 'stdin',
+  buildArgs: (_prompt, outFile) => [
     'exec',
-    prompt,
+    '-',
     '--ignore-user-config',
     '--skip-git-repo-check',
     '-s',
@@ -102,12 +117,15 @@ export const CLAUDE_SEAT: SeatSpec = {
   bin: 'claude',
   configHomeEnv: null,
   authFiles: [],
-  buildArgs: (prompt) => ['-p', prompt, '--output-format', 'text'],
+  // stdin 으로 가정한다. `claude -p` 가 파이프 입력을 읽는지는 미측정이므로
+  // 주간 한도가 풀린 뒤 확인해야 한다.
+  promptVia: 'stdin',
+  buildArgs: () => ['-p', '--output-format', 'text'],
   readResult: (_outFileContent, stdout) => trimmed(stdout),
   quota: { window: 'week', limit: null, resetAt: '20:00 Asia/Seoul' },
   maxConcurrent: null,
   verified: false,
-  note: '주간 한도 소진으로 성공 경로 미측정. 설정 격리 수단 미확인.',
+  note: '주간 한도 소진으로 성공 경로 미측정. 설정 격리 수단과 stdin 입력 미확인.',
 };
 
 /**
@@ -125,7 +143,10 @@ export const GEMINI_SEAT: SeatSpec = {
   bin: 'gemini',
   configHomeEnv: null,
   authFiles: [],
-  buildArgs: (prompt) => [prompt, '-o', 'text'],
+  // Gemini CLI 도움말: "-p, --prompt  Prompt. Appended to input on stdin (if any)."
+  // stdin 입력을 받는다고 적혀 있으나 계정 구성 미비로 실측하지 못했다.
+  promptVia: 'stdin',
+  buildArgs: () => ['-o', 'text'],
   readResult: (_outFileContent, stdout) => trimmed(stdout),
   quota: { window: 'unknown', limit: null, resetAt: null },
   maxConcurrent: null,
@@ -146,7 +167,8 @@ export const CURSOR_SEAT: SeatSpec = {
   bin: 'cursor-agent',
   configHomeEnv: null,
   authFiles: [],
-  buildArgs: (prompt) => ['-p', prompt],
+  promptVia: 'stdin',
+  buildArgs: () => ['-p'],
   readResult: (_outFileContent, stdout) => trimmed(stdout),
   quota: { window: 'unknown', limit: null, resetAt: null },
   maxConcurrent: null,

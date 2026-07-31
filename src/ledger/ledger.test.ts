@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Ledger, digestPayload, hashEvent } from './ledger.js';
@@ -136,6 +136,45 @@ describe('verify — 개조 검출 (R9.2)', () => {
     expect(r.ok).toBe(false);
     expect(r.problems[0]?.problem).toBe('unparseable');
     expect(r.lastGoodSeq).toBe(2);
+  });
+});
+
+describe('동시 쓰기 (실제 사고에서 나온 테스트)', () => {
+  it('같은 파일을 두 인스턴스가 번갈아 써도 체인이 온전하다', () => {
+    // 실제로 겪은 사고: 레시피 실행과 중복 실행 거부가 동시에 append 해서
+    // seq 2 가 두 번 쓰였고 체인이 깨졌다. 각자 자기 메모리의 seq 를 믿었기 때문이다.
+    const a = Ledger.open(file);
+    const b = Ledger.open(file);
+
+    a.append({ actor: sysActor, kind: 'decision', summary: 'A1' });
+    b.append({ actor: sysActor, kind: 'deny', summary: 'B1' });
+    a.append({ actor: sysActor, kind: 'decision', summary: 'A2' });
+    b.append({ actor: sysActor, kind: 'deny', summary: 'B2' });
+
+    const r = Ledger.open(file).verify();
+    expect(r.ok, JSON.stringify(r.problems)).toBe(true);
+    expect(r.count).toBe(4);
+    expect(a.all().map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('나중에 연 인스턴스가 앞선 쓰기를 덮어쓰지 않는다', () => {
+    const a = Ledger.open(file);
+    a.append({ actor: sysActor, kind: 'ingest' });
+    a.append({ actor: sysActor, kind: 'ingest' });
+
+    // b 는 이벤트가 2건일 때 열렸다고 가정
+    const b = Ledger.open(file);
+    a.append({ actor: sysActor, kind: 'ingest' });
+    const fromB = b.append({ actor: sysActor, kind: 'publish' });
+
+    expect(fromB.seq).toBe(4);
+    expect(Ledger.open(file).verify().ok).toBe(true);
+  });
+
+  it('락 파일을 남기지 않는다', () => {
+    const led = Ledger.open(file);
+    led.append({ actor: sysActor, kind: 'ingest' });
+    expect(existsSync(`${file}.lock`)).toBe(false);
   });
 });
 

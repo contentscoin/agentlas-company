@@ -131,8 +131,27 @@ export interface RunResult {
  * 타임아웃 시 프로세스 트리를 정리한다.
  */
 export function runCmd(name: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
+  return spawnLine([name, ...args].map(quoteArg).join(' '), opts);
+}
+
+/**
+ * 이미 완성된 셸 명령줄을 그대로 실행한다.
+ *
+ * `runCmd` 는 인자를 인용하므로 `node -e "x"` 같은 명령줄을 넘기면
+ * 전체가 하나의 인자로 인용되어 깨진다. 게이트 명령처럼 우리가 작성한
+ * 명령줄은 이 함수로 돈다.
+ *
+ * 중요한 경계: 이 함수에 들어오는 문자열은 **운영자가 작성한 설정**
+ * (레시피 파일, 정책 파일)에서만 와야 한다. 에이전트 산출물이 여기로
+ * 흘러들면 임의 명령 실행이 되므로, 레시피 파일은 정책 파일과 같은
+ * 신뢰 등급으로 취급하고 에이전트가 쓸 수 없는 경로에 둔다.
+ */
+export function runShell(commandLine: string, opts: RunOptions = {}): Promise<RunResult> {
+  return spawnLine(commandLine, opts);
+}
+
+function spawnLine(line: string, opts: RunOptions): Promise<RunResult> {
   const started = Date.now();
-  const line = [name, ...args].map(quoteArg).join(' ');
 
   return new Promise<RunResult>((resolve) => {
     const child = spawn(line, {

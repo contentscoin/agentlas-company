@@ -108,6 +108,33 @@ $ npm run demo:injection
 목록으로 0 에 고정된다. 원장에는 본문 대신 digest 만 남긴다 — 공격자가 심은 문장을 원장에
 실어 나르면 그 원장을 읽는 다음 에이전트가 같은 공격에 노출된다.
 
+## 반복 업무
+
+업무를 코드가 아니라 선언으로 적는다. 스텝마다 담당 주체, 산출물, 통과를 판정하는
+결정론적 게이트 명령을 명시한다.
+
+```
+$ company run recipes/smoke.yaml
+smoke → paused  (run aba71f4c…)
+  passed             draft
+  passed             shape-gate
+  awaiting-approval  publish-approval  오너 결정 대기
+  승인 후 이어서: company run recipes/smoke.yaml --resume aba71f4c…
+
+$ company approvals approve <id> --digest <d> --step-up --device phone-1
+$ company run recipes/smoke.yaml --resume aba71f4c…
+smoke → completed
+  passed             publish-approval  승인 확인
+```
+
+**승인 스텝은 블로킹이 아니다.** 승인 카드 TTL 이 12시간인데 예약 작업이 그동안 프로세스를
+붙잡으면 좌석이 잠기고 재부팅에도 못 견딘다. 실행은 `paused` 로 끝나고 재개가 이어받으며,
+통과한 스텝은 다시 돌지 않는다 — 좌석 호출 1회가 약 19.4k 토큰이라 재실행이 공짜가 아니다.
+
+**상시 기동은 OS 에 위임한다.** 자체 supervisor 를 만들지 않는다. 프로세스를 감시하는
+프로세스는 그 자신이 죽으면 아무도 감시하지 않는다. `company schedule` 이 등록 명령문을
+출력하고 실제 등록은 오너가 실행한다 — 시스템 스케줄러 변경을 코드가 조용히 하지 않는다.
+
 **조용한 성공을 만들지 않는다.** 미확인은 추정으로 채우지 않고 `unknown`으로 남긴다.
 게이트 실패는 다음 스텝을 막는다. Hands가 요소를 못 찾으면 성공으로 승격되지 않는다.
 

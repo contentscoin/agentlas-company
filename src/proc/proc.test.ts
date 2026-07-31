@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { envWithPath, isAlive, isWin, killTree, quoteArg, runCmd } from './index.js';
+import { envWithPath, isAlive, isWin, killTree, quoteArg, runCmd, runShell } from './index.js';
 
 describe('quoteArg', () => {
   it('공백 없는 단순 인자는 그대로 둔다', () => {
@@ -70,6 +70,31 @@ describe('killTree', () => {
   it('없는 pid 로 불러도 던지지 않는다', () => {
     expect(() => killTree(undefined)).not.toThrow();
     expect(() => killTree(2_147_483_646)).not.toThrow();
+  });
+});
+
+describe('runShell — 완성된 명령줄', () => {
+  it('인용된 인자를 포함한 명령줄이 깨지지 않는다', async () => {
+    const r = await runShell('node -e "process.stdout.write(\'SHELL_OK\')"');
+    expect(r.code).toBe(0);
+    expect(r.stdout.trim()).toBe('SHELL_OK');
+  });
+
+  it('종료 코드를 보존한다 — 게이트 판정의 근거', async () => {
+    expect((await runShell('node -e "process.exit(0)"')).code).toBe(0);
+    expect((await runShell('node -e "process.exit(1)"')).code).toBe(1);
+  });
+
+  it('runCmd 로 같은 명령줄을 넘기면 깨진다 — 두 함수가 따로 있는 이유', async () => {
+    const viaShell = await runShell('node -e "process.exit(0)"');
+    const viaCmd = await runCmd('node -e "process.exit(0)"', []);
+    expect(viaShell.code).toBe(0);
+    expect(viaCmd.code).not.toBe(0);
+  });
+
+  it('타임아웃을 지킨다', async () => {
+    const r = await runShell('node -e "setTimeout(()=>{}, 60000)"', { timeoutMs: 1500 });
+    expect(r.timedOut).toBe(true);
   });
 });
 

@@ -275,6 +275,9 @@ export class ApprovalService {
     if (request.status === 'consumed') return { allowed: false, reason: 'already-consumed', request };
     if (request.status === 'aborted') return { allowed: false, reason: 'aborted', request };
     if (request.status === 'expired') return { allowed: false, reason: 'expired', request };
+    // 거부와 무효는 종단 상태다. 대기로 해석하면 레시피가 영원히 재개를 시도한다.
+    if (request.status === 'rejected') return { allowed: false, reason: 'rejected', request };
+    if (request.status === 'invalidated') return { allowed: false, reason: 'digest-mismatch', request };
     if (request.status !== 'approved') return { allowed: false, reason: 'not-approved', request };
 
     if (request.payloadDigest !== payloadDigest) {

@@ -95,9 +95,29 @@ Task 1 산출물. 좌석 CLI의 **실측** 계약. 추정값을 넣지 않는다
 수다스러운 다회차 대화는 이 구조에서 성립하지 않는다. 회의 설계가 호출 수를
 아끼는 방향이어야 한다.
 
-**End-to-end 지연 (브로커 경유 실측).** 10,874ms.
-프롬프트가 한 줄인데도 11초가 걸린다. 라이브오피스의 "경과 시간" 표시가
-장식이 아니라 실제로 필요한 이유다.
+**End-to-end 지연 (브로커 경유 실측).** 10,874ms / 13,008ms / 19,339ms.
+프롬프트가 한 줄인데도 11~19초가 걸리고 편차가 크다. 라이브오피스의 "경과 시간"
+표시가 장식이 아니라 실제로 필요한 이유다.
+
+**프롬프트는 stdin 으로 넘겨야 한다 (레시피 실행에서 발견).**
+
+한 줄 프롬프트는 셸 인자로 잘 동작했지만, 레시피의 여러 줄 지시문을 인자로
+넘기자 `exit 1` 로 실패했다. 개행이 명령줄을 깨뜨린 것이다. 그리고 Windows
+명령줄 길이 상한이 약 8191자라, 컨텍스트 팩(자료 여러 건 + 역할 정의)을
+인자로는 애초에 실을 수 없다.
+
+`codex exec --help` 원문: "[PROMPT] Initial instructions for the agent.
+If not provided as an argument (or if `-` is used), instructions are read from stdin."
+
+`codex exec -` 로 stdin 전달을 실측 확인했다 (여러 줄, EXIT=0).
+`SeatSpec.promptVia: 'stdin'` 을 기본으로 두고 arg 경로는 예외로 남긴다.
+
+| 좌석 | promptVia | 실측 |
+|---|---|---|
+| codex | stdin | 확인 |
+| claude | stdin | 미확인 (주간 한도) |
+| gemini | stdin | 미확인 (계정 구성). 도움말에 "Appended to input on stdin" 명시 |
+| cursor | stdin | 미확인 (미설치) |
 
 부수 관찰: stderr에 `codex_models_manager::cache: failed to load models cache:
 missing field supports_reasoning_summaries` 경고가 나오지만 호출은 성공했다.
