@@ -260,6 +260,32 @@ describe('원장 기록과 오염 전파', () => {
   });
 });
 
+describe('askWithPack — 오염 전파를 잊을 수 없게 한다', () => {
+  it('팩이 오염되면 결과와 원장이 오염으로 표시된다', async () => {
+    const broker = new SeatBroker({
+      ledger,
+      seats: [fakeSeat({ id: 'codex', vendor: 'openai' })],
+      runner: writeOut('답변'),
+    });
+    const pack = { prompt: '질문', tainted: true, minTrust: 0 as const, sources: [], signals: [] };
+    const r = await broker.askWithPack('research', pack);
+    expect(r.ok).toBe(true);
+    expect(r.tainted).toBe(true);
+    expect(ledger.query({ kind: 'seat.call', tainted: true })).toHaveLength(1);
+  });
+
+  it('깨끗한 팩은 오염되지 않는다', async () => {
+    const broker = new SeatBroker({
+      ledger,
+      seats: [fakeSeat({ id: 'codex', vendor: 'openai' })],
+      runner: writeOut('답변'),
+    });
+    const pack = { prompt: '질문', tainted: false, minTrust: 2 as const, sources: [], signals: [] };
+    const r = await broker.askWithPack('ceo', pack);
+    expect(r.tainted).toBe(false);
+  });
+});
+
 describe('status (R2.6)', () => {
   it('좌석별 검증 여부와 사유를 보고한다', () => {
     const broker = new SeatBroker({

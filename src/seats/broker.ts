@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { runCmd, type RunResult } from '../proc/index.js';
 import { Ledger, digestPayload } from '../ledger/ledger.js';
 import type { SeatId } from '../ledger/types.js';
+import type { BuiltPack } from '../taint/types.js';
 import { createProfile, type SeatProfile } from './profile.js';
 import { ALL_SEATS, effectiveConcurrency, type SeatSpec, type Vendor } from './spec.js';
 
@@ -157,6 +158,21 @@ export class SeatBroker {
     state.running--;
     const next = state.waiters.shift();
     if (next) next();
+  }
+
+  /**
+   * 컨텍스트 팩으로 묻는다.
+   *
+   * 오염 전파를 호출자가 잊을 수 없게 만드는 진입점이다.
+   * `ask` 는 `tainted` 를 넘기는 것을 잊을 수 있지만, 이 함수는
+   * 팩이 계산한 값을 그대로 쓴다 (R16.3).
+   */
+  async askWithPack(
+    persona: string,
+    pack: BuiltPack,
+    opts: Omit<AskRequest, 'persona' | 'prompt' | 'tainted'> = {},
+  ): Promise<AskResult> {
+    return this.ask({ ...opts, persona, prompt: pack.prompt, tainted: pack.tainted });
   }
 
   /** 좌석에 한 번 묻는다. 큐·예산·폴백·원장 기록을 모두 처리한다. */
