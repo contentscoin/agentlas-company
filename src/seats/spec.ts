@@ -7,8 +7,15 @@
  */
 
 import type { SeatId } from '../ledger/types.js';
+import { ollamaSeat } from './providers.js';
 
-export type Vendor = 'anthropic' | 'openai' | 'google' | 'cursor';
+/**
+ * 벤더 계열.
+ *
+ * `local` 은 기계 안에서 도는 모델이다. 다른 벤더와 모델 계열이 달라
+ * Critic 의 교차 비평(R3.4)에 쓸 수 있고, 계정이 없으니 쿼터도 없다.
+ */
+export type Vendor = 'anthropic' | 'openai' | 'google' | 'cursor' | 'local';
 
 /** 쿼터 창. claude 는 주간이고 codex 는 일간이다 (실측). */
 export interface QuotaWindow {
@@ -176,7 +183,21 @@ export const CURSOR_SEAT: SeatSpec = {
   note: '에이전트 CLI 미설치. Cloud Agents API 는 R1.5 로 금지.',
 };
 
-export const ALL_SEATS: readonly SeatSpec[] = [CODEX_SEAT, CLAUDE_SEAT, GEMINI_SEAT, CURSOR_SEAT];
+/**
+ * 로컬 모델 이름. 환경변수로 바꿀 수 있다.
+ *
+ * 기본값을 작은 모델로 둔 이유는 미니PC 에서 좌석 4개와 브라우저 자동화가
+ * 함께 도는데 큰 모델이 메모리를 독점하면 회사가 멈추기 때문이다.
+ */
+export const OLLAMA_MODEL = process.env.AGENTLAS_OLLAMA_MODEL ?? 'llama3.2:1b';
+
+export const ALL_SEATS: readonly SeatSpec[] = [
+  CODEX_SEAT,
+  CLAUDE_SEAT,
+  GEMINI_SEAT,
+  CURSOR_SEAT,
+  ollamaSeat(OLLAMA_MODEL),
+];
 
 export function seatById(id: SeatId): SeatSpec {
   const found = ALL_SEATS.find((s) => s.id === id);

@@ -16,6 +16,7 @@ import { Ledger } from './ledger/ledger.js';
 import type { EventKind, QueryFilter } from './ledger/types.js';
 import { SeatBroker } from './seats/broker.js';
 import { ALL_SEATS, effectiveConcurrency } from './seats/spec.js';
+import { distinctVendors, providerFor } from './seats/providers.js';
 import { createProfile } from './seats/profile.js';
 import { resolveState } from './paths.js';
 import { CapabilityStore } from './capabilities/store.js';
@@ -62,6 +63,7 @@ function cmdSeats(argv: string[]): number {
     return {
       seat: spec.id,
       vendor: spec.vendor,
+      auth: providerFor(spec.id)?.auth ?? 'unknown',
       bin: spec.bin,
       verified: spec.verified,
       isolation: spec.configHomeEnv ?? 'unknown',
@@ -75,22 +77,30 @@ function cmdSeats(argv: string[]): number {
     };
   });
 
+  const verifiedSpecs = ALL_SEATS.filter((s) => s.verified);
+  const vendors = distinctVendors(verifiedSpecs);
+
   if (hasFlag(argv, '--json')) {
-    jsonOut({ seats: rows, verifiedCount: rows.filter((r) => r.verified).length });
+    jsonOut({
+      seats: rows,
+      verifiedCount: rows.filter((r) => r.verified).length,
+      distinctVendors: vendors,
+      crossVendorPossible: vendors.length >= 2,
+    });
     return rows.some((r) => r.verified) ? EXIT_OK : EXIT_FINDING;
   }
 
-  out('좌석      벤더        검증   격리          쿼터창    한도      동시성');
-  out('-'.repeat(78));
+  out('좌석      벤더        인증    검증   격리          쿼터창    한도');
+  out('-'.repeat(76));
   for (const r of rows) {
     const cells = [
       r.seat.padEnd(9),
       r.vendor.padEnd(11),
+      r.auth.padEnd(7),
       (r.verified ? 'yes' : 'no').padEnd(6),
       (r.isolationWorks ? r.isolation : `${r.isolation}(미적용)`).padEnd(13),
       r.quotaWindow.padEnd(9),
-      String(r.quotaLimit ?? 'unknown').padEnd(9),
-      String(r.maxConcurrent ?? 'unknown(1로 취급)'),
+      String(r.quotaLimit ?? 'unknown'),
     ];
     out(cells.join(''));
     if (r.note) out(`          └ ${r.note}`);
@@ -98,6 +108,12 @@ function cmdSeats(argv: string[]): number {
   const verified = rows.filter((r) => r.verified).length;
   out('');
   out(`가동 가능 좌석 ${verified}/${rows.length}`);
+  out(`서로 다른 벤더 ${vendors.length}종 (${vendors.join(', ') || '없음'})`);
+  out(
+    vendors.length >= 2
+      ? '크로스벤더 회의 가능 — Critic 을 다른 벤더 좌석에 앉힐 수 있다 (R3.4)'
+      : '크로스벤더 회의 불가 — Critic 이 본체와 같은 벤더가 되어 회의(Task 6)가 막혀 있다',
+  );
   return verified > 0 ? EXIT_OK : EXIT_FINDING;
 }
 

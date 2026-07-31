@@ -20,16 +20,31 @@ const REPO = join(HERE, '..', '..');
 const STRIP_LIST = 'src/seats/strip-env.ts';
 const ALLOW_NAMES = [STRIP_LIST, 'src/seats/strip-env.test.ts', 'scripts/gates/no-api-keys.mjs'];
 
-// 벤더 키 변수 이름. 이름을 조각으로 조립해 이 게이트 자신이 자기 규칙에 걸리지 않게 한다.
+// 이름을 열거하지 않고 **패턴**으로 잡는다.
+//
+// 처음에는 벤더 이름을 목록으로 뒀는데 구멍이 있었다. OPENROUTER_API_KEY 를
+// 소스에 넣고 게이트를 돌렸더니 통과했다 — 목록에 없는 벤더였기 때문이다.
+// 프로바이더는 계속 늘어나므로 허용목록 방식은 언젠가 반드시 뚫린다.
+// 그래서 `<대문자>_API_KEY` 형태 전부와 알려진 토큰 변형을 패턴으로 막는다.
 const SUFFIX = '_API_KEY';
-const VENDOR_PREFIXES = ['ANTHROPIC', 'OPENAI', 'GEMINI', 'GOOGLE', 'CURSOR', 'AZURE_OPENAI', 'GROQ', 'MISTRAL'];
-const KEY_NAMES = VENDOR_PREFIXES.map((p) => p + SUFFIX).concat(['ANTHROPIC_AUTH_TOKEN', 'OPENAI_BASE_URL']);
+const GENERIC_KEY = '\\b[A-Z][A-Z0-9_]*' + SUFFIX + '\\b';
+const EXTRA_NAMES = [
+  'ANTHROPIC_AUTH_TOKEN',
+  'OPENAI_BASE_URL',
+  'ANTHROPIC_BASE_URL',
+  'OPENROUTER_BASE_URL',
+  'HF_TOKEN',
+  'REPLICATE_API_TOKEN',
+  'TOGETHER_API_TOKEN',
+  'DEEPSEEK_TOKEN',
+];
 
-const NAME_RE = new RegExp('\\b(' + KEY_NAMES.join('|') + ')\\b');
+const NAME_RE = new RegExp('(' + GENERIC_KEY + '|\\b(' + EXTRA_NAMES.join('|') + ')\\b)');
 
 // 값을 읽는 행위: process.env.X / process.env['X'] / env.X / env["X"]
+const KEY_IN_ACCESS = '(?:[A-Z][A-Z0-9_]*' + SUFFIX + '|' + EXTRA_NAMES.join('|') + ')';
 const READ_RE = new RegExp(
-  '(process\\.)?env(\\.(' + KEY_NAMES.join('|') + ')\\b|\\[\\s*[\'"`](' + KEY_NAMES.join('|') + ')[\'"`]\\s*\\])',
+  '(process\\.)?env(\\.' + KEY_IN_ACCESS + '\\b|\\[\\s*[\'"`]' + KEY_IN_ACCESS + '[\'"`]\\s*\\])',
 );
 
 try {

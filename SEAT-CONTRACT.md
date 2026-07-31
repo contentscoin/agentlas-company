@@ -191,6 +191,51 @@ stderr가 `NativeCommandError`로 승격되어 호출자를 오도한다. 브로
 codex와 gemini가 `.ps1` 셔틀이다. `proc.js`의 Windows 인용 처리가 필요한 이유가
 여기서 실측으로 확인됐다.
 
+### S5 ollama (로컬 모델 좌석)
+
+오너 요청("오픈코덱스로 다양한 프로바이더")을 제약 안에서 구현한 결과다.
+멀티프로바이더 포크·프록시·게이트웨이는 대부분 OpenRouter·DeepSeek 등의
+**API 키**로 붙어 R1 에 걸린다. 키 없이 벤더를 늘리는 유일한 두 갈래가
+OAuth 로컬 CLI 와 **로컬 모델**이다.
+
+```
+설치      ollama 0.1.34 (2024-05-07 설치본)
+GPU       GTX 1660 SUPER 6GB, 시스템 RAM 32GB
+호출      ollama run <모델>   프롬프트는 stdin 또는 인자
+```
+
+| 항목 | 실측 |
+|---|---|
+| `/api/tags` | 200, 모델 2종 인식 |
+| `/api/ps` | **404** — 이 버전에 없는 엔드포인트 |
+| `/api/generate` | **타임아웃** (16분 46초 후 500) |
+| `ollama run` (stdin) | exit 1, 출력 0바이트 |
+| `ollama run` (인자) | 10분 초과, 응답 없음 |
+
+**근본 원인 (server.log).**
+
+```
+llama_model_load: error loading model:
+  done_getting_tensors: wrong number of tensors; expected 147, got 146
+error loading llama server: timed out waiting for llama runner to start
+```
+
+설치된 런타임이 2년 이상 오래돼서 llama3.2 아키텍처를 로드하지 못한다.
+런너 디렉터리도 `cuda_v11.3` 세대다. 기존 `llama3:latest` 는 blob 이
+사라져 이미 깨져 있었다.
+
+**판정: 로컬 좌석은 코드는 완성됐고 런타임이 막고 있다.**
+`verified: false` 로 두고 사유를 기록한다. 해결 경로 둘.
+
+1. Ollama 를 최신으로 업그레이드 — 기존 설치 앱을 교체하므로 오너 확인 필요
+2. 0.1.34 가 지원하는 세대 모델을 받기 — `llama3:latest` 재수신(4.7GB).
+   8B 를 6GB VRAM 에 부분 오프로드하므로 응답이 느릴 수 있다
+
+**이 좌석이 왜 중요한가.** 제약 준수가 아니라 **교착 해소** 때문이다.
+지금 검증된 좌석이 codex 하나뿐이라 R3.4(Critic 은 다른 벤더)를 만족할 수
+없어 회의(Task 6)가 막혀 있다. 로컬 좌석은 벤더가 다르고 쿼터가 없어
+그 교착을 푼다. `company seats` 가 이 상태를 마지막 줄에 명시한다.
+
 ## 미측정 항목 (다음 측정 대상)
 
 | 항목 | 왜 아직 안 했는가 |

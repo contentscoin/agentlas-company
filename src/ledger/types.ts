@@ -10,7 +10,13 @@ export const GENESIS_HASH = '0'.repeat(64);
 
 export type ActorKind = 'agent' | 'owner' | 'system';
 
-export type SeatId = 'claude' | 'codex' | 'gemini' | 'cursor';
+/**
+ * 좌석 식별자.
+ *
+ * `ollama` 는 로컬 모델 좌석이다. 구독도 API 키도 없이 벤더 하나를 더 확보해
+ * 크로스벤더 회의(R3.4)의 교착을 푼다.
+ */
+export type SeatId = 'claude' | 'codex' | 'gemini' | 'cursor' | 'ollama';
 
 export type AutonomyLevel = 'L0' | 'L1' | 'L2' | 'L3';
 
