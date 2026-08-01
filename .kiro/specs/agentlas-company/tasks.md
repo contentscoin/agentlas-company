@@ -55,10 +55,20 @@
   - [ ] 5.1 예산 카운터 영속화 — 지금은 프로세스 메모리에만 있어 재시작 시 초기화된다
   - _Requirements: R1.1, R1.4, R2_
 
-- [ ] 6. 조직과 회의  *(선행 조건 해소됨 — 벤더 2종 가동, 크로스벤더 라우팅 실측 확인)*
-  - 페르소나 정의, 2라운드 턴제 회의 엔진, `DECISION`/`OPEN`/`ACTIONS` 마감 블록
-  - `companyctl decision --json` 소비, 크로스벤더 강제, CRITICAL dissent 승격, War Room
-  - 시연: `company meeting exec --agenda "..."` → Discord 스레드에 독립 발언 + 마감 블록
+- [x] 6. 조직과 회의
+  - [x] 임원 7명 정의 — 인격은 프롬프트가 아니라 좌석 배정이다
+  - [x] 1라운드 독립 수집 — 다른 임원 발언을 주지 않는다 (R3.1)
+  - [x] 2라운드 반론 — 다른 임원 1라운드 **전문** 제공, 자기 발언은 제외 (R3.2)
+  - [x] CEO 집계 → `DECISION`/`OPEN`/`ACTIONS` 마감 블록. 형식 위반 시 실패 (R3.3)
+  - [x] 좌석 배치가 Critic 에게 본체 벤더를 금지. 벤더 1종이면 시작조차 안 함 (R3.4)
+  - [x] VERDICT 파싱 — 값이 없거나 형식 위반이면 BLOCK. BLOCKERS 있는 CLEAR 는 강등
+  - [x] BLOCK 은 다수결로 기각되지 않고 War Room 으로. 판정 주체는 CEO 가 아니라 프로토콜 (R3.5, R3.7)
+  - [x] `companyctl decision --dry-run` 으로 정규화. 도구 부재 시 건너뛴 사실을 남긴다 (R3.6)
+  - [x] 마감 블록은 BOM 없이 쓴다 — BOM 이 업스트림 파서의 첫 줄을 삼킨다(실측)
+  - [x] 실측 회의: 임원 2명 2라운드 + Critic(claude) + CEO(codex) 6회 호출, 1분 40초
+  - [x] 결과: Critic WATCH 5건이 결정에 반영됨. 결정 5 · 미결 5 · 액션 6, 업스트림 정규화 통과
+  - [ ] 6.1 War Room 종결 UI — 오너 종결 경로는 Task 14 콘솔에서 붙인다
+  - [ ] 6.2 동일 과제 2회 실패 카운터 영속화 (R3.7 후반부)
   - _Requirements: R3_
 
 - [x] 7. 정책 게이트와 승인

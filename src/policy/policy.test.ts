@@ -93,9 +93,12 @@ describe('승격 (R4.4)', () => {
     expect(c.escalatedBy).toContain('critic-block');
   });
 
-  it('PASS 나 CONCERN 은 올리지 않는다', () => {
-    expect(classify(policy, { action: 'publish.threads', criticVerdict: 'PASS' }).level).toBe('L1');
-    expect(classify(policy, { action: 'publish.threads', criticVerdict: 'CONCERN' }).level).toBe('L1');
+  it('CLEAR 는 올리지 않는다', () => {
+    expect(classify(policy, { action: 'publish.threads', criticVerdict: 'CLEAR' }).level).toBe('L1');
+  });
+
+  it('WATCH 도 올리지 않는다 — 우려는 있으나 진행 가능이라는 뜻이다', () => {
+    expect(classify(policy, { action: 'publish.threads', criticVerdict: 'WATCH' }).level).toBe('L1');
   });
 
   it('SEI 리스크 신호로 올린다', () => {

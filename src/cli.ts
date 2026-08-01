@@ -25,6 +25,8 @@ import { humanRemaining, parseTtl } from './capabilities/ttl.js';
 import { classify, loadPolicy } from './policy/policy.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
+import { randomUUID } from 'node:crypto';
+import { Meeting } from './org/meeting.js';
 import { RecipeEngine } from './recipes/engine.js';
 import { loadRecipe } from './recipes/load.js';
 import { currentPlatform, emitForPlatform, parseSchedule } from './recipes/schedule.js';
@@ -416,6 +418,90 @@ function cmdSchedule(argv: string[]): number {
   return EXIT_OK;
 }
 
+/** 임원 회의 (R3). */
+async function cmdMeeting(argv: string[]): Promise<number> {
+  const agenda = flagValue(argv, '--agenda');
+  if (!agenda) {
+    process.stderr.write('사용법: company meeting --agenda "안건" [--attendees cto,growth] [--companyctl <경로>]\n');
+    return EXIT_CANNOT_RUN;
+  }
+
+  const attendees = (flagValue(argv, '--attendees') ?? 'cto,growth').split(',').map((s) => s.trim());
+  const ledger = Ledger.open(ledgerPath(argv));
+  const broker = new SeatBroker({ ledger });
+  const companyctl = flagValue(argv, '--companyctl');
+
+  const meeting = new Meeting({
+    ledger,
+    broker,
+    stateDir: resolveState(),
+    ...(companyctl ? { companyctl } : {}),
+  });
+
+  const runId = flagValue(argv, '--run') ?? randomUUID();
+  let result;
+  try {
+    result = await meeting.run({ agenda, attendees: attendees as never, runId });
+  } catch (err) {
+    process.stderr.write(`회의를 시작할 수 없습니다: ${(err as Error).message}\n`);
+    return EXIT_FINDING;
+  }
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut(result);
+    return result.status === 'closed' ? EXIT_OK : EXIT_FINDING;
+  }
+
+  out(`회의 ${result.status}  (run ${result.runId})`);
+  out('');
+  for (const round of [
+    { label: '1라운드', turns: result.round1 },
+    { label: '2라운드', turns: result.round2 },
+  ]) {
+    for (const t of round.turns) {
+      out(`${round.label} ${t.persona} → ${t.seat} (${t.ms}ms)`);
+      for (const line of t.text.split('\n').slice(0, 4)) out(`    ${line}`);
+      out('');
+    }
+  }
+
+  if (result.verdict) {
+    out(`Critic  ${result.verdict.verdict}`);
+    for (const b of result.verdict.blockers) out(`    BLOCK  ${b}`);
+    for (const w of result.verdict.watch) out(`    WATCH  ${w}`);
+    out('');
+  }
+
+  if (result.block) {
+    out('마감 블록');
+    for (const d of result.block.decisions) out(`    DECISION  ${d}`);
+    for (const o of result.block.open) out(`    OPEN      ${o}`);
+    for (const a of result.block.actions) {
+      out(`    ACTION    @${a.owner} : ${a.task}${a.due ? ` (DUE: ${a.due})` : ''}`);
+    }
+    out('');
+  }
+
+  if (result.normalized !== undefined) {
+    out('companyctl 정규화 완료');
+  } else if (result.normalizationSkipped) {
+    out(`companyctl 정규화 건너뜀 — ${result.normalizationSkipped}`);
+  }
+
+  if (result.status === 'war-room') {
+    out('');
+    out('War Room 소집 — Critic 이 BLOCK 했습니다. 다수결로 기각되지 않습니다.');
+    out(`사유: ${result.reason}`);
+    out('오너만 종결할 수 있습니다.');
+  }
+  if (result.status === 'failed') {
+    out('');
+    out(`실패: ${result.reason}`);
+  }
+
+  return result.status === 'closed' ? EXIT_OK : EXIT_FINDING;
+}
+
 function policyFile(argv: string[]): string {
   return flagValue(argv, '--policy') ?? join(resolveState(), 'policy.yaml');
 }
@@ -451,7 +537,7 @@ function cmdClassify(argv: string[]): number {
   const critic = flagValue(argv, '--critic');
   const c = classify(policy, {
     action,
-    ...(critic ? { criticVerdict: critic as 'BLOCK' | 'PASS' | 'CONCERN' } : {}),
+    ...(critic ? { criticVerdict: critic.toUpperCase() as 'CLEAR' | 'WATCH' | 'BLOCK' } : {}),
     ...(hasFlag(argv, '--sei-risk') ? { seiRisk: true } : {}),
     ...(hasFlag(argv, '--tainted') ? { tainted: true } : {}),
   });
@@ -565,6 +651,9 @@ function usage(): void {
   out('  company approvals reject <id> [--reason 사유]');
   out('  company approvals abort <id>        유예 창 안에서 중단');
   out('');
+  out('  회의 (R3) — 2라운드 턴제, Critic 은 다른 벤더 좌석');
+  out('  company meeting --agenda "안건" [--attendees cto,growth] [--companyctl <경로>]');
+  out('');
   out('  반복 업무 (R12)');
   out('  company run <레시피.yaml>            레시피 실행');
   out('  company run <레시피.yaml> --resume <runId>   멈춘 지점부터 재개');
@@ -596,6 +685,8 @@ async function main(): Promise<number> {
         return await cmdRun(argv);
       case 'schedule':
         return cmdSchedule(argv);
+      case 'meeting':
+        return await cmdMeeting(argv);
       case undefined:
       case '-h':
       case '--help':

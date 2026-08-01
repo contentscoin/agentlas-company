@@ -52,7 +52,14 @@ export interface PolicyConfig {
 /** 등급 판정에 들어가는 신호. */
 export interface ClassifyInput {
   action: string;
-  criticVerdict?: 'PASS' | 'BLOCK' | 'CONCERN';
+  /**
+   * Critic 판정. 값은 업스트림 PROTOCOLS.md v1 계약을 따른다.
+   *
+   * 처음에는 `PASS | CONCERN | BLOCK` 으로 적었는데 실제 프로토콜을 확인하고
+   * 맞췄다. 계약이 둘로 갈리면 게이트가 헛돈다 — Critic 이 `WATCH` 를 냈는데
+   * 우리 정책은 그 문자열을 모르니 승격이 조용히 일어나지 않는다.
+   */
+  criticVerdict?: 'CLEAR' | 'WATCH' | 'BLOCK';
   seiRisk?: boolean;
   tainted?: boolean;
   /** 되돌릴 수 없는 작업인가. 유예 창 적용 여부를 결정한다 (R4.11). */
