@@ -40,6 +40,16 @@ export interface PublishRequest {
   brandPass?: boolean;
   /** 브랜드 위반 내역. 체크리스트에 그대로 실린다. */
   brandNotes?: string[];
+  /**
+   * 결정론적 검증 판정 (R11.5).
+   *
+   * `BLOCK` 이면 발행하지 않는다. **`undefined` 는 막지 않는다** — 브랜드
+   * 게이트와 다르게 두는 이유는, 검증이 산출물에 붙는 것이고 산출물 없이
+   * 직접 발행하는 경로(오너가 손으로 쓴 공지 등)가 정당하기 때문이다.
+   * 그 경로에서는 브랜드 책임 선언(`brandPass`)이 이미 오너의 확인이다.
+   */
+  assurance?: 'PASS' | 'FAIL' | 'BLOCK';
+  assuranceNotes?: string[];
 }
 
 /** 발행이 남긴 증거 (R6.2). URL 이거나 스크린샷이거나, 둘 다일 수 있다. */
@@ -63,6 +73,8 @@ export type PublishFailure =
   | 'secret-detected'
   /** 브랜드 팩 대조에 실패했다 (R5.5). */
   | 'brand-fail'
+  /** 결정론적 검증이 BLOCK 을 냈다 (R11.5). */
+  | 'assurance-block'
   | 'not-configured';
 
 export interface PublishResult {

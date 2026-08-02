@@ -5,8 +5,12 @@
 # 좌석 호출 1회의 하한이 약 19.4k 토큰·11초(실측)이므로 스텝 수를 아꼈다.
 # 수다스러운 다회차 구조는 이 시스템에서 성립하지 않는다.
 #
-# publish 와 retro 스텝은 아직 구현되지 않았고, 엔진이 그것을 통과로
-# 처리하지 않고 실패로 멈춘다. 조용한 성공을 만들지 않기 위한 의도된 동작이다.
+# publish 는 Task 9 에서, retro 는 R11 에서 실물이 붙었다.
+#
+# retro 의 `expect` 는 필수다 — 예측 없는 복기는 사후 소감이지 복기가
+# 아니다 (R11.6). 지금 지표 수집 어댑터가 없어 실측은 "수집 못 함" 으로
+# 남고, 복기의 첫 제안이 "먼저 측정을 고치세요" 가 된다. 0 으로 채우면
+# 레시피를 잘못 고치게 되므로 그렇게 하지 않는다.
 
 name: weekly-content-cycle
 schedule: 'MON 09:00'
@@ -77,9 +81,19 @@ steps:
     title: 쓰레드 발행
     channel: threads
     subject: draft
+    # 브랜드 대조는 Studio 가 하고, 여기서는 오너가 책임을 진다는 선언이다.
+    # Studio 스텝이 생기면 이 줄은 사라진다 (Task 15.3).
+    brandOk: true
 
   - id: retro
     kind: retro
     title: 7일 후 복기
     afterDays: 7
-    subject: draft
+    # 복기 대상은 발행 스텝이다 — 무엇의 성과인지가 분명해야 한다.
+    subject: publish
+    # 예측을 먼저 적는다. 이 숫자가 틀려도 괜찮다 — 틀린 예측과 실제를
+    # 대조하는 것이 복기이고, 예측이 없으면 대조할 것이 없다.
+    expect:
+      views: 300
+      likes: 20
+      replies: 3

@@ -31,6 +31,7 @@ import { RunLock } from './lock.js';
 import type { Recipe, RunOutcome, RunState, Step, StepState } from './types.js';
 import type { PublishBroker } from '../publish/broker.js';
 import { isChannel } from '../verbs/types.js';
+import { compare, noPrediction } from '../assurance/retro.js';
 
 export interface EngineOptions {
   ledger: Ledger;
@@ -388,11 +389,44 @@ export class RecipeEngine {
       }
 
       case 'retro': {
-        // R11(검증과 복기)이 아직 없다. 구현되지 않은 것을 통과로 처리하지
-        // 않는다 — 레시피가 초록으로 끝나는데 복기가 없는 상태를 만들지 않는다.
-        st.status = 'failed';
-        st.detail = 'retro 스텝은 아직 구현되지 않았다 (R11 검증·복기 미구현)';
-        return 'stop';
+        // 예측이 없으면 복기가 아니다 (R11.6). 사후 소감을 복기라고 부르지 않는다.
+        if (!step.expect || Object.keys(step.expect).length === 0) {
+          const skipped = noPrediction(state.runId, step.subject);
+          st.status = 'failed';
+          st.detail = skipped.amendments.join(' / ');
+          return 'stop';
+        }
+
+        // 지표 수집 경로가 아직 없다 (`read_metrics` 어댑터 부재). 실측을
+        // 주입받지 못했으므로 전부 "수집 못 함" 이고, 그 사실이 제안 맨
+        // 위에 올라간다 — 0 으로 채우면 레시피를 잘못 고치게 된다.
+        // 복기 대상은 발행 스텝의 id 다. 채널까지 끌어오려면 레시피 전체를
+        // 여기로 넘겨야 하는데, 표시용 이름 하나 때문에 그럴 이유가 없다 —
+        // 어느 스텝의 성과인지가 분명하면 충분하다.
+        const retro = compare(
+          {
+            runId: state.runId,
+            channel: step.subject,
+            expected: step.expect,
+            afterDays: step.afterDays,
+            at: new Date().toISOString(),
+          },
+          null,
+        );
+
+        this.ledger.append({
+          actor: { kind: 'system', id: 'retro' },
+          kind: 'retro',
+          runId: state.runId,
+          summary:
+            `복기 ${step.subject} — 지표 ${retro.gaps.length}건, ` +
+            `수집 못 함 ${retro.uncollected.length}건`,
+        });
+
+        state.artifacts[`${step.id}.amendments`] = retro.amendments.join('\n');
+        st.status = 'passed';
+        st.detail = `복기 완료 — 제안 ${retro.amendments.length}건 (수집 못 함 ${retro.uncollected.length})`;
+        return 'continue';
       }
     }
   }

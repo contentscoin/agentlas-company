@@ -50,6 +50,8 @@ import { ALL_PERSONAS } from './org/personas.js';
 import { checkHealth } from './ops/health.js';
 import { detectAnomalies, describeAnomaly, unreadableLedger } from './ops/anomaly.js';
 import { buildDigest, renderDigest } from './ops/digest.js';
+import { registerClaims, describeClaim } from './assurance/claims.js';
+import { assure, describeFinding as describeAssurance } from './assurance/checks.js';
 import { DEFAULT_VERB_POLICY } from './verbs/types.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
@@ -1377,6 +1379,86 @@ function cmdOps(argv: string[]): number {
   return EXIT_CANNOT_RUN;
 }
 
+/**
+ * 검증 (R11).
+ *
+ * 산출물의 클레임을 등록하고 결정론적 검사를 돌린다. `BLOCK` 이면 발행이
+ * 막힌다 (R11.5) — 이 명령은 그 판정을 미리 보는 자리다.
+ */
+function cmdAssure(argv: string[]): number {
+  const file = flagValue(argv, '--file') ?? argv[1];
+  if (!file || file.startsWith('--')) {
+    process.stderr.write(
+      '사용법: company assure <산출물.txt> [--facts <팩.json>]\n' +
+        '        --facts 는 {"packFacts":[],"measured":[]} 형태입니다.\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    process.stderr.write(`읽지 못했습니다: ${(err as Error).message}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  let sources = { packFacts: [] as string[], measured: [] as string[] };
+  const factsFile = flagValue(argv, '--facts');
+  if (factsFile) {
+    try {
+      const raw = JSON.parse(readFileSync(factsFile, 'utf8')) as Partial<typeof sources>;
+      sources = { packFacts: raw.packFacts ?? [], measured: raw.measured ?? [] };
+    } catch (err) {
+      process.stderr.write(`근거 파일을 읽지 못했습니다: ${(err as Error).message}\n`);
+      return EXIT_CANNOT_RUN;
+    }
+  }
+
+  const claims = registerClaims(text, sources);
+  const citations = extractCitationLines(text);
+  // SEI 는 아직 이 기계에 없다. 못 돌린 사실을 판정에 싣는다.
+  const result = assure({
+    text,
+    claims,
+    citations,
+    sei: { ran: false, note: 'sei CLI 가 설치되어 있지 않다 — 자체 검사만 돌렸다' },
+  });
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut(result);
+    return result.verdict === 'PASS' ? EXIT_OK : EXIT_FINDING;
+  }
+
+  out(`검증  ${result.verdict}`);
+  out('');
+  out(`클레임 ${claims.length}건`);
+  for (const c of claims) out(`  ${describeClaim(c)}`);
+  out('');
+  out(`발견 ${result.findings.length}건`);
+  for (const f of result.findings) out(`  ${describeAssurance(f)}`);
+  if (!result.seiRan) {
+    out('');
+    out(`SEI 미실행 — ${result.seiNote}`);
+  }
+  if (result.verdict === 'BLOCK') {
+    out('');
+    out('BLOCK 이므로 발행으로 넘어가지 않습니다 (R11.5).');
+  }
+  return result.verdict === 'PASS' ? EXIT_OK : EXIT_FINDING;
+}
+
+/** `[출처]` 줄과 URL 을 인용으로 센다. Studio 의 규약과 같다. */
+function extractCitationLines(text: string): string[] {
+  const cites = new Set<string>();
+  for (const line of text.split('\n')) {
+    const m = /^\s*\[(?:출처|근거|source|ref)\]\s*(.+)$/i.exec(line);
+    if (m?.[1]) cites.add(m[1].trim());
+  }
+  for (const url of text.match(/https?:\/\/[^\s)\]]+/g) ?? []) cites.add(url);
+  return [...cites];
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
   const sub = subcommand(argv);
@@ -1493,6 +1575,9 @@ function usage(): void {
   out('  company publish --verb <동사.json> [--key <멱등키>] [--dry-run] [--brand-ok]');
   out('      동사는 파일로만 받습니다. 자유 텍스트를 받는 인자는 없습니다');
   out('');
+  out('  검증 (R11) — 클레임 등록과 결정론적 검사. BLOCK 은 발행을 막는다');
+  out('  company assure <산출물.txt> [--facts <팩.json>]');
+  out('');
   out('  무인 운영 (R17) — 재부팅 복귀·이상 탐지·일일 요약');
   out('  company ops health               부팅 후 원장·스위치·표면 점검');
   out('  company ops watch [--halt]       거부·볼륨 급증 탐지 (--halt 는 전체 차단)');
@@ -1551,6 +1636,8 @@ async function main(): Promise<number> {
         return await cmdHire(argv);
       case 'ops':
         return cmdOps(argv);
+      case 'assure':
+        return cmdAssure(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':

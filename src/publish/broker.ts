@@ -168,7 +168,20 @@ export class PublishBroker {
       );
     }
 
-    // 4 — 멱등성. 이미 나갔으면 그 증거를 그대로 돌려준다 (R6.3).
+    // 4 — 결정론적 검증 (R11.5). BLOCK 은 발행으로 넘어가지 않는다.
+    //
+    // FAIL 은 막지 않는다. DoD 미달은 사람이 판단할 여지가 있고, 그것까지
+    // 막으면 기준을 낮추려고 검증을 끄게 된다 — 끈 검증은 없는 검증이다.
+    if (req.assurance === 'BLOCK') {
+      return this.fail(
+        req,
+        'assurance-block',
+        `검증 BLOCK — ${(req.assuranceNotes ?? []).length}건`,
+        ['아래를 고친 뒤 다시 시도하세요:', ...(req.assuranceNotes ?? [])],
+      );
+    }
+
+    // 5 — 멱등성. 이미 나갔으면 그 증거를 그대로 돌려준다 (R6.3).
     const already = this.opts.store.find(req.idempotencyKey);
     if (already) {
       this.opts.ledger.append({
@@ -189,7 +202,7 @@ export class PublishBroker {
       };
     }
 
-    // 5 — 일일 상한 (R6.5).
+    // 6 — 일일 상한 (R6.5).
     const used = this.opts.store.countToday(req.channel);
     const cap = this.limit(req.channel);
     if (used >= cap) {
@@ -201,7 +214,7 @@ export class PublishBroker {
 
     const ready = adapter.ready();
 
-    // 6 — 드라이런은 여기서 끝. 아무것도 바꾸지 않으므로 승인이 필요 없다 (R6.4).
+    // 7 — 드라이런은 여기서 끝. 아무것도 바꾸지 않으므로 승인이 필요 없다 (R6.4).
     //
     // **준비 검사보다 앞이다.** 드라이런의 쓸모가 가장 큰 순간이 자격증명을
     // 아직 넣지 않았을 때다 — "무엇이 나갈 것인가" 는 토큰 없이도 답할 수
@@ -220,12 +233,12 @@ export class PublishBroker {
       };
     }
 
-    // 7 — 어댑터가 실제로 나갈 수 있는가.
+    // 8 — 어댑터가 실제로 나갈 수 있는가.
     if (!ready.ok) {
       return this.fail(req, 'not-configured', ready.reason, ready.checklist);
     }
 
-    // 8 — 게이트. 발행은 비가역이므로 최소 L3 이다.
+    // 9 — 게이트. 발행은 비가역이므로 최소 L3 이다.
     const digest = publishDigest(req);
     const decision = resolveGate(
       { policy: this.opts.policy, approvals: this.opts.approvals, ledger: this.opts.ledger },
@@ -242,7 +255,7 @@ export class PublishBroker {
       ]);
     }
 
-    // 9 — 발행.
+    // 10 — 발행.
     const runId = req.runId ?? req.idempotencyKey;
     const evidenceDir = join(this.opts.evidenceRoot, runId);
     mkdirSync(evidenceDir, { recursive: true });

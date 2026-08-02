@@ -91,15 +91,45 @@ export function validateRecipe(value: unknown): string[] {
     if (kind === 'retro') {
       if (typeof s['afterDays'] !== 'number') problems.push(`${at}.afterDays 가 필요하다`);
       if (typeof s['subject'] !== 'string') problems.push(`${at}.subject 가 필요하다`);
+      // 예측을 실행 전에 요구한다. 실행 중에 없다는 것을 알면 앞 스텝의
+      // 좌석 호출과 발행이 이미 끝난 뒤다 — 복기만 못 하는 상태가 된다.
+      const expect = s['expect'];
+      if (expect === undefined) {
+        problems.push(`${at}.expect 가 필요하다 — 예측 없는 복기는 사후 소감이다 (R11.6)`);
+      } else if (typeof expect !== 'object' || expect === null || Array.isArray(expect)) {
+        problems.push(`${at}.expect 는 "지표: 숫자" 객체여야 한다`);
+      } else if (!Object.values(expect as Record<string, unknown>).every((v) => typeof v === 'number')) {
+        problems.push(`${at}.expect 의 값은 전부 숫자여야 한다`);
+      }
     }
   });
 
-  // 참조하는 산출물이 앞에서 만들어지는지 확인한다.
+  // 참조 검사. `subject` 의 의미가 스텝 종류마다 다르다.
+  //
+  //   seat/gate/approval/publish  이전 스텝이 만든 **산출물** 이름
+  //   retro                       복기할 **발행 스텝의 id**
+  //
+  // 처음에는 전부 산출물로 검사했는데, 그러면 복기가 발행이 아니라 초안을
+  // 가리키게 되고 "무엇의 성과인가" 가 흐려진다. R11 을 붙이면서 갈랐다.
+  const stepIds = new Set(
+    (r['steps'] as unknown[])
+      .map((raw) => (typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>)['id'] : null))
+      .filter((id): id is string => typeof id === 'string'),
+  );
+
   (r['steps'] as unknown[]).forEach((raw, i) => {
     if (typeof raw !== 'object' || raw === null) return;
     const s = raw as Record<string, unknown>;
     const subject = s['subject'];
-    if (typeof subject === 'string' && !produced.has(subject)) {
+    if (typeof subject !== 'string') return;
+
+    if (s['kind'] === 'retro') {
+      if (!stepIds.has(subject)) {
+        problems.push(`steps[${i}].subject 가 없는 스텝을 참조한다: ${subject}`);
+      }
+      return;
+    }
+    if (!produced.has(subject)) {
       problems.push(`steps[${i}].subject 가 만들어지지 않는 산출물을 참조한다: ${subject}`);
     }
   });

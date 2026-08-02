@@ -19,6 +19,8 @@
  * 앞과 뒤를 다르게 보는데, 그 이유는 `findTerm` 주석에 적었다.
  */
 
+import { extractClaims } from '../assurance/claims.js';
+
 export interface MasterSheet {
   /** 쓰면 안 되는 표현. */
   forbidden: string[];
@@ -151,36 +153,29 @@ export function checkBrand(text: string, pack: BrandPack): BrandVerdict {
  * 근거 없는 주장을 찾는다 (R5.1 의 인용과 짝).
  *
  * 수치와 효능 표현을 뽑아 `content_base` 에 대응하는 근거가 있는지 본다.
- * 완전한 사실 검증은 불가능하므로 **패턴이 있는 것만** 잡는다 — "3배",
- * "1위", "효과가 있다" 같은 것들이다. 못 잡는 주장이 있다는 사실을 숨기지
- * 않기 위해, 이 함수는 `checkBrand` 와 분리해 두고 결과도 따로 보고한다.
+ * 완전한 사실 검증은 불가능하므로 **패턴이 있는 것만** 잡는다. 못 잡는
+ * 주장이 있다는 사실을 숨기지 않기 위해 `checkBrand` 와 분리해 두고 결과도
+ * 따로 보고한다.
  */
 export function findUnsupportedClaims(text: string, base: ContentBase): BrandViolation[] {
-  // 수치는 활용형이 다양해(빠릅니다·빨라졌다·개선됐다) 서술어로 좁히면
-  // 대부분을 놓친다. **숫자로 된 크기 주장 자체**를 근거 대상으로 본다 —
-  // 브랜드 카피에 숫자가 나오면 출처가 있어야 한다는 것이 원래 규칙이다.
-  const patterns: RegExp[] = [
-    /\d+\s*(?:배|%|퍼센트)/g,
-    /(?:업계|국내|세계)\s*(?:1위|최초|최고)/g,
-    /(?:완치|치료|의학적으로\s*입증)/g,
-  ];
-
+  // 클레임 추출 패턴은 `assurance/claims.ts` 가 정본이다. 여기에 복사해 두면
+  // 한쪽만 개선되고 다른 쪽이 뒤처진다 — 실제로 처음에 복사해 두었다가
+  // R11 을 만들면서 정본을 하나로 모았다.
+  //
+  // 판정은 다르다. 여기는 **브랜드 규칙**(content_base 에 있는 사실인가)이고,
+  // assurance 는 **검증 등급**(팩 인용인가 실측인가)이다. 같은 주장이 브랜드
+  // 규칙은 통과하고 검증은 미달일 수 있다.
   const violations: BrandViolation[] = [];
-  for (const pattern of patterns) {
-    const re = new RegExp(pattern.source, pattern.flags);
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      const claim = m[0];
-      const supported = base.claims.some((c) => findTerm(text, c).length > 0 || c.includes(claim));
-      if (!supported) {
-        violations.push({
-          rule: 'unsupported-claim',
-          detail: `근거 없는 주장 "${claim}" — content_base 에 대응하는 근거가 없다`,
-          index: m.index,
-        });
-      }
-      if (m.index === re.lastIndex) re.lastIndex += 1;
-    }
+  for (const claim of extractClaims(text)) {
+    const supported = base.claims.some(
+      (c) => findTerm(text, c).length > 0 || c.includes(claim.text),
+    );
+    if (supported) continue;
+    violations.push({
+      rule: 'unsupported-claim',
+      detail: `근거 없는 주장 "${claim.text}" — content_base 에 대응하는 근거가 없다`,
+      index: claim.index,
+    });
   }
   return violations;
 }

@@ -82,11 +82,18 @@ export interface PublishStep extends StepBase {
   dryRun?: boolean;
 }
 
-/** 발행 후 성과 회수와 복기. Task 13 에서 실물이 붙는다. */
+/**
+ * 발행 후 성과 회수와 복기 (R11.6, R11.7).
+ *
+ * `subject` 는 예측을 등록한 발행 스텝의 id 다. **예측이 없으면 복기하지
+ * 않는다** — 사후 소감은 복기가 아니다.
+ */
 export interface RetroStep extends StepBase {
   kind: 'retro';
   afterDays: number;
   subject: string;
+  /** 지표 이름 → 예측값. 없으면 복기할 것이 없다. */
+  expect?: Record<string, number>;
 }
 
 export type Step = SeatStep | GateStep | ApprovalStep | PublishStep | RetroStep;
