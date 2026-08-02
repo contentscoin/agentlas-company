@@ -117,6 +117,28 @@ export type HandsStep =
 
 export type HandsParseResult = { ok: true; step: HandsStep } | { ok: false; errors: string[] };
 
+/**
+ * 페이지 상태를 바꿀 수 있는 동사.
+ *
+ * 런처는 결제·전송·발행·삭제 **의도**로 게이팅하는데, 그 판정은 실행 시점의
+ * 요소 텍스트와 페이지 URL 에 달려 있어 우리가 미리 알 수 없다. 그러면
+ * 기준을 어디에 둘 것인가 — **부분 적용의 위험**에 둔다.
+ *
+ * 읽기 전용 계획은 실패해도 세상을 반쯤 바꿔놓지 못한다. 조작 계획은 할 수
+ * 있다. 10단계 중 7번째에서 desktop 이 없어 멈추면 앞의 6단계는 이미
+ * 적용된 뒤다. 그래서 조작이 하나라도 있으면 출발 전에 desktop 을 요구한다.
+ */
+export const MUTATING_OPS: readonly HandsOp[] = ['click', 'type', 'press_key', 'select_option'];
+
+export function isMutating(op: HandsOp): boolean {
+  return MUTATING_OPS.includes(op);
+}
+
+/** 계획이 desktop 승인 서버를 요구하는가. */
+export function planNeedsDesktop(steps: readonly { op: HandsOp }[]): boolean {
+  return steps.some((s) => isMutating(s.op));
+}
+
 export interface HandsPolicy {
   /** Hands 가 이동할 수 있는 도메인. 비어 있으면 이동 자체를 금지한다. */
   allowedDomains: string[];

@@ -11,7 +11,7 @@ import {
   toolArguments,
   type HandsRunInput,
 } from './executor.js';
-import type { HandsStep } from './types.js';
+import { isMutating, planNeedsDesktop, type HandsStep } from './types.js';
 
 let dir: string;
 let ledger: Ledger;
@@ -60,7 +60,6 @@ function executor(behavior: 'ok' | 'tool-error' | 'silent' | 'crash'): HandsExec
   const server = fakeServer(behavior);
   return new HandsExecutor({
     ledger,
-    requireDesktop: false,
     // 표면은 가짜다 — 이 컨테이너에 Chrome 도 desktop 도 없다. 전송 계층을
     // 진짜로 돌리기 위해 표면 점검만 대체하고 MCP 왕복은 실제로 한다.
     inspect: () => ({ ok: true, launcher: server, approvalFile: null, problems: [], detail: [] }),
@@ -185,6 +184,45 @@ describe('HandsExecutor — 실행 경로', () => {
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('transport-failed');
     expect(ledger.query({ kind: 'deny' }).length).toBeGreaterThan(0);
+  });
+});
+
+describe('planNeedsDesktop — 부분 적용 위험으로 판정한다', () => {
+  it('읽기 전용 계획은 desktop 없이도 돈다', () => {
+    expect(
+      planNeedsDesktop([{ op: 'navigate', url: 'https://x.com' }, { op: 'snapshot' }, { op: 'screenshot' }]),
+    ).toBe(false);
+  });
+
+  it('조작이 하나라도 섞이면 desktop 을 요구한다', () => {
+    expect(planNeedsDesktop([{ op: 'snapshot' }, { op: 'click', element: 'a', ref: 'e1' }])).toBe(true);
+  });
+
+  it('조작 동사 넷을 모두 조작으로 센다', () => {
+    expect((['click', 'type', 'press_key', 'select_option'] as const).every(isMutating)).toBe(true);
+    expect((['navigate', 'snapshot', 'screenshot', 'wait_for'] as const).some(isMutating)).toBe(false);
+  });
+
+  it('조작 계획은 표면 부재 시 0단계 실행 전에 멈춘다 — 부분 적용이 없다', async () => {
+    const server = fakeServer('ok');
+    const exec = new HandsExecutor({
+      ledger,
+      inspect: (requireDesktop) => ({
+        ok: !requireDesktop,
+        launcher: server,
+        approvalFile: null,
+        problems: requireDesktop ? ['desktop-not-running'] : [],
+        detail: [],
+      }),
+      createClient: () => new McpClient({ command: process.execPath, args: [server] }),
+    });
+
+    const mutating = await exec.run(input({ steps: PLAN }));
+    expect(mutating.reason).toBe('surface-unavailable');
+    expect(mutating.steps).toHaveLength(0);
+
+    const readOnly = await exec.run(input({ steps: [{ op: 'navigate', url: 'https://x.com' }, { op: 'snapshot' }] }));
+    expect(readOnly.ok).toBe(true);
   });
 });
 

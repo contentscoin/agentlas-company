@@ -68,7 +68,18 @@ export function approvalFilePath(): string | null {
   return null;
 }
 
-/** Chrome 실행 파일 후보. desktop 의 `browserCdpExecutableCandidates` 와 같은 자리를 본다. */
+/**
+ * Chrome 실행 파일 후보.
+ *
+ * **런처의 `chromeInfo()` 목록과 같아야 한다.** 이 목록이 런처보다 짧으면
+ * 실제로는 도는 기계에서 `chrome-missing` 을 보고한다 — Edge 만 있거나
+ * Chrome 이 `/opt/google/chrome/chrome` 에 있는 기계가 그렇다. 실측 중
+ * 실제로 짧게 적어 두었던 것을 발견해 맞췄다.
+ *
+ * 우리가 여기서 다시 찾는 이유는, 런처를 띄우기 **전에** 왜 안 되는지
+ * 알려주기 위해서다. 런처를 띄워서 죽는 것을 보고 판단하면 오너에게
+ * 남는 것은 스택 트레이스뿐이다.
+ */
 export function chromeCandidates(): string[] {
   const home = homedir();
   if (process.platform === 'win32') {
@@ -79,12 +90,25 @@ export function chromeCandidates(): string[] {
       join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'),
       join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
       join(local, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     ];
   }
   if (process.platform === 'darwin') {
-    return ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'];
+    return [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      join(home, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    ];
   }
-  return ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium'];
+  return [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/opt/google/chrome/chrome',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/microsoft-edge',
+  ];
 }
 
 /**

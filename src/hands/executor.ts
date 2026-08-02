@@ -18,7 +18,7 @@
 
 import { createHash } from 'node:crypto';
 import type { Ledger } from '../ledger/ledger.js';
-import { HANDS_TOOL, type HandsStep } from './types.js';
+import { HANDS_TOOL, planNeedsDesktop, type HandsStep } from './types.js';
 import { inspectSurface, type Surface } from './locate.js';
 import { McpClient } from './mcp.js';
 
@@ -63,13 +63,19 @@ export interface HandsExecutorOptions {
   /** 테스트가 가짜 서버를 끼울 수 있게 열어 둔다. */
   createClient?: (surface: Surface) => McpClient;
   /**
+   * desktop 승인 서버를 항상 요구할지 강제한다.
+   *
+   * 기본값은 계획을 보고 정한다 — 조작이 하나라도 있으면 요구하고, 읽기
+   * 전용이면 요구하지 않는다. 근거는 `types.ts` 의 `MUTATING_OPS` 주석.
+   */
+  requireDesktop?: boolean;
+  /**
    * 표면 점검을 대체한다.
    *
    * 실제 실행에서는 절대 쓰지 않는다 — 표면 점검을 건너뛰면 desktop 이
    * 없는데도 도는 것처럼 보인다. 테스트가 가짜 MCP 서버를 물릴 때만 쓴다.
    */
-  inspect?: () => Surface;
-  requireDesktop?: boolean;
+  inspect?: (requireDesktop: boolean) => Surface;
 }
 
 /** 계획의 digest. 승인은 이 값에 묶인다 (R4.6). */
@@ -135,13 +141,13 @@ export function checklistFrom(steps: readonly HandsStep[], failedAt: number): st
 export class HandsExecutor {
   private readonly ledger: Ledger;
   private readonly createClient: (surface: Surface) => McpClient;
-  private readonly inspect: () => Surface;
-  private readonly requireDesktop: boolean;
+  private readonly inspect: (requireDesktop: boolean) => Surface;
+  private readonly requireDesktop: boolean | undefined;
 
   constructor(opts: HandsExecutorOptions) {
     this.ledger = opts.ledger;
-    this.requireDesktop = opts.requireDesktop ?? true;
-    this.inspect = opts.inspect ?? ((): Surface => inspectSurface({ requireDesktop: this.requireDesktop }));
+    this.requireDesktop = opts.requireDesktop;
+    this.inspect = opts.inspect ?? ((requireDesktop): Surface => inspectSurface({ requireDesktop }));
     this.createClient =
       opts.createClient ??
       ((surface) =>
@@ -184,7 +190,9 @@ export class HandsExecutor {
       return this.deny('gate-denied', input.gateReason ?? '정책 게이트가 거부했다', input);
     }
 
-    const surface = this.inspect();
+    // 조작이 섞인 계획만 desktop 을 요구한다. 읽기 전용 계획을 desktop 부재로
+    // 막으면, 실패해도 세상을 바꾸지 않는 작업을 이유 없이 세우는 것이 된다.
+    const surface = this.inspect(this.requireDesktop ?? planNeedsDesktop(input.steps));
     if (!surface.ok) {
       const result = this.deny('surface-unavailable', surface.problems.join(', '), input);
       return { ...result, surface };

@@ -172,17 +172,24 @@ Task 10(네이버 블로그 Hands 경로)에 의존하고, L3 비가역 작업�
     실패 시 남은 단계를 사람이 이어받을 체크리스트로 산출(R7.5)
   - 조작 하나에 게이트가 둘이다 — company 승인 게이트와, 런처가 결제·게시·삭제에
     대해 desktop 승인 UI 로 거는 게이트
-  - **미완**: 실제 브라우저 조작 시연. 이 컨테이너에 Chrome·desktop 이 없어 표면 점검이
-    `chrome-missing, desktop-not-running` 으로 정확히 막는 것까지만 확인했다.
-    **오너 기계에서 1회 실행이 남아 있다**
+  - **실제 브라우저 왕복 확인 완료(2026-08-02).** desktop 소스에서 런처를 물질화하고
+    Chromium 141 로 실행해 `company hands` 를 완주시켰다 — navigate·snapshot·screenshot
+    3단계 전부 ok, 스냅샷이 실제 접근성 트리(`heading … [ref=e2]`, `textbox "제목"
+    [ref=e3]`)를 반환했다. 원장 14건 무결성 정상. 가짜 서버가 아니라
+    company → 런처 → @playwright/mcp → 진짜 Chromium 의 전 구간이다
+  - `planNeedsDesktop` — desktop 요구 여부를 계획으로 판정한다. 런처는 실행 시점의
+    요소 텍스트·URL 로 게이팅해서 미리 알 수 없으므로, 기준을 **부분 적용의 위험**에
+    두었다. 읽기 전용 계획은 실패해도 세상을 반쯤 바꾸지 못하고 조작 계획은 바꿀 수
+    있다. 실측에서 조작 계획이 0단계 실행 **전에** 멈추는 것을 확인했다
   - **미구현**: R7.2 단계별 스크린샷 증거는 도구 보고의 digest 만 남긴다. 이미지 파일
     보존은 실제 브라우저 왕복을 보고 정해야 해서 열어 뒀다
   - **미구현**: R7.6 스마트스토어 집계값 전용. 읽기 동사가 아직 없어 Task 9 에서 붙인다
   - _Requirements: R7.1, R7.3, R7.4, R7.5 (R7.2·R7.6 은 위 미구현 참조)_
   - _업스트림: agentlas-desktop `electron/mcp-tools/browser-cdp-launcher.ts`, `electron/browser/`_
 
-  - [ ] 10.1 오너 기계에서 실제 조작 1회 실행 — Chrome·desktop 이 있는 환경에서
-        `company hands --plan` 완주 확인. 여기서 R7.2 증거 형식도 확정한다
+  - [ ] 10.1 Windows + desktop 기동 상태에서 조작 동사(click/type) 1회 실행.
+        읽기 전용 경로는 Linux/Chromium 으로 확인했으나, 조작 경로는 desktop 승인
+        게이트가 실제로 떠야 통과한다. 여기서 R7.2 증거 형식도 확정한다
   - [ ] 10.2 desktop 미설치 환경의 동작 확정 — 지금은 `surface-unavailable` 로 막는다.
         체크리스트 폴백으로 강등할지는 Task 9 실사용 후 결정
 
