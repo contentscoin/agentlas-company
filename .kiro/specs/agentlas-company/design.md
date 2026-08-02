@@ -91,7 +91,27 @@ flowchart TB
 
 computer-use 의 계약은 정확합니다. 제어 파일 `<userData>/computer-use/control.json` 이 `{ schemaVersion: 1, port, token }` 을 mode `0600` 으로 쓰고, 환경변수 `AGENTLAS_COMPUTER_USE_CONTROL_FILE` 이 그 경로를 가리키며, 도구는 16종(`computer_status`, `click`, `type_text`, `press_key` 등)입니다. Task 10 은 이 계약에 바인딩하고 desktop 내부 구현에는 의존하지 않습니다 — Python 업스트림을 `--json` 계약으로만 소비하는 것과 같은 규칙입니다.
 
-**MCP 등록은 집행이 아닙니다.** desktop 의 외부 MCP 레지스트리에 company 를 stdio 서버로 올리면 desktop 안의 에이전트가 원장 기록·승인 요청을 **할 수 있게** 됩니다. 하지만 desktop 자신의 동작이 우리 게이트를 **거치지는** 않습니다. MCP 는 도구를 제공하지 호출을 가로채지 않습니다. 통제 계층이 실제로 집행되려면 desktop 쪽에 게이트 훅이 필요하고, 그것이 Task 16.0 의 내용입니다. 이 구분을 흐리면 "초록인데 틀린 상태"가 됩니다 — 원장에 기록은 쌓이는데 아무것도 막지 못하는 상태.
+**MCP 등록은 집행이 아닙니다.** desktop 의 외부 MCP 레지스트리에 company 를 stdio 서버로 올리면 desktop 안의 에이전트가 원장 기록·승인 요청을 **할 수 있게** 됩니다. 하지만 desktop 자신의 동작이 우리 게이트를 **거치지는** 않습니다. MCP 는 도구를 제공하지 호출을 가로채지 않습니다. 이 구분을 흐리면 "초록인데 틀린 상태"가 됩니다 — 원장에 기록은 쌓이는데 아무것도 막지 못하는 상태.
+
+그래서 집행은 **실행 표면이 실행 전에 직접 묻는** 형태로 만들었습니다 (Task 16.0 완료).
+
+```
+desktop installAgent()  ──spawn──▶  company gate --action agent.borrow --digest <d> --json
+                                          │
+                                          ├─ 종료 0  인가        → persistListing() 진행
+                                          ├─ 종료 1  거부        → throw, 설치 중단
+                                          └─ 종료 2  묻지 못함    → throw, 설치 중단
+```
+
+계약의 세부는 셋입니다.
+
+- **종료 2 를 1 과 구분합니다.** "안 된다고 답했다"와 "물어보지 못했다"는 다른 사실이고 답인 것은 앞의 하나뿐입니다. 다만 처리는 둘 다 거부입니다 — 2 를 통과로 해석하면 게이트를 끄는 방법이 게이트를 고장내는 것이 됩니다. spawn 실패·타임아웃도 같습니다.
+- **CLI 경로는 절대 경로여야 합니다.** 맨 이름은 PATH 로 해석되고, 그러면 PATH 섀도잉이 진짜 게이트를 대신해 "허용"이라 답하는 경로가 됩니다. 보안 통제를 PATH 로 해석하지 않습니다.
+- **승인은 동작을 결정하는 필드의 digest 에 묶입니다** — 지시문·trust grade·MCP 서버·env 요구 키 + Hub 릴리스 해시. Hub 가 준 `packageHash` 를 단독으로 신뢰하지 않는 이유는, 같은 해시로 내용만 바뀐 패키지가 무해한 버전에 내준 승인을 재사용할 수 있기 때문입니다 (R4.6).
+
+프로세스 경계를 넘는 것은 식별자뿐입니다. 지시문과 env 값은 넘어가지 않습니다.
+
+기본은 꺼져 있습니다. `AGENTLAS_COMPANY_GATE_CLI` 가 없으면 desktop 은 단독 제품으로 그대로 동작합니다. 켠다는 것은 막힐 수 있다는 데 동의한다는 뜻입니다.
 
 **재사용 자산이 없는 것도 확정했습니다.** desktop 에 채널 발행 구현은 없습니다. `creative-pack/`·`ecommerce-pack/` 은 각각 `surface.ts` 하나이고 `threads`·`instagram` 은 `experience/taxonomy.ts` 와 `mcp-tools/catalog.ts` 의 문자열입니다. 따라서 **Task 9(첫 발행 루프)는 그대로 company 의 자체 구현으로 남습니다.** 요구사항의 "빈 기계 리스크"가 지목한 우선순위는 이 정정 이후에도 유효합니다.
 

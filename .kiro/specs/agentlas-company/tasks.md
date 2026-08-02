@@ -230,18 +230,34 @@ Task 10(네이버 블로그 Hands 경로)에 의존하고, L3 비가역 작업�
 - [ ] 16. 에이전트 채용 — desktop Hub 연동
   - **재정의(2026-08-02)**: Hub·마켓플레이스·패키지 저장을 자체 구현하지 않는다.
     desktop 의 `cloud-agents/`·`marketplace/`·`hub-bookmark-sync.ts` 가 이미 갖고 있다
-  - [ ] 16.0 **선행 조건 — desktop 게이트 훅.** desktop 의 채용·차용 경로는 `ipcMain` 뒤에
-        있어 헤드리스로 닿지 않는다. 그리고 desktop 외부 MCP 레지스트리에 company 를
-        등록하는 것은 **능력 제공이지 집행이 아니다** — MCP 는 도구를 줄 뿐 호출을
-        가로채지 않는다. 이 구분을 흐리면 원장에 기록만 쌓이고 아무것도 막지 못한다.
-        desktop 쪽에 게이트 훅(차용 전 company 승인 조회)을 넣는 변경이 선행되어야 한다.
-        **이건 desktop 저장소 변경이므로 별도 승인이 필요하다 — 오너 결정 대기**
+  - [x] 16.0 **선행 조건 — desktop 게이트 훅** (오너 승인 2026-08-02, 완료)
+    - MCP 레지스트리 등록은 **능력 제공이지 집행이 아니다** — MCP 는 도구를 줄 뿐
+      호출을 가로채지 않는다. 그래서 실행 표면이 실행 전에 **직접 묻는** 형태로 만들었다
+    - company 쪽: `src/policy/gate.ts` 의 `resolveGate()` + `company gate` 명령.
+      종료 코드가 계약이다 — 0 인가 / 1 거부 / 2 묻지 못함
+    - desktop 쪽: `electron/agents/company-gate.ts` + `electron/mcp/registry.ts` 의
+      `installAgent()`·`installMyAgent()` 훅. 차용 경로는 이 둘뿐이다
+    - **2 를 1 과 구분한다.** "안 된다고 답했다" 와 "물어보지 못했다" 는 다른 사실이고
+      답인 것은 앞의 하나뿐이다. 2 를 통과로 해석하면 게이트를 끄는 방법이 게이트를
+      고장내는 것이 된다. spawn 실패·타임아웃·종료코드 2 는 전부 거부다
+    - **CLI 경로는 절대 경로 강제.** 맨 이름은 PATH 로 해석되고 PATH 섀도잉이 진짜
+      게이트를 대신해 "허용"이라 답하는 경로가 된다. 풀 가치가 있는 해석 문제가 아니다
+    - 승인은 동작을 결정하는 필드의 digest 에 묶인다 — 지시문·trust grade·MCP 서버·
+      env 요구 키 + Hub 릴리스 해시. `packageHash` 를 단독 신뢰하지 않으므로 같은
+      해시로 내용만 바뀐 패키지가 승인을 재사용할 수 없다 (R4.6)
+    - 프로세스 경계를 넘는 것은 식별자뿐. 지시문과 env 값은 넘어가지 않는다
+    - 기본은 꺼져 있다. `AGENTLAS_COMPANY_GATE_CLI` 미설정이면 desktop 단독 동작 그대로
+    - 실측: 1차 거부 → 오너 승인 → 2차 인가(소비) → 3차 거부(재사용 불가), fail-closed 4종
+    - _PR: agentlas-company#1, agentlas-desktop#1_
+    - **남은 것**: desktop 저장소가 테스트를 gitignore 한다(owner decision 2026-07-26).
+      훅의 회귀 방어가 desktop CI 에 없다 — 판정 로직은 company 쪽 18개 단위 테스트가
+      덮지만 훅 자체는 덮지 않는다. desktop 테스트 정책이 바뀌면 붙인다
   - `HIRE` 블록 처리와 L3 승인은 company 가 소유한다 (통제 계층)
   - 차용 패키지 digest 를 `vendor.lock` 의 `borrowed_agents` 에 핀 (R13.2 — 이미 자리 있음)
   - 차용 패키지 무권한 기본값, 좌석 예산 초과 시 거부
   - 시연: 회의 결정 → desktop Hub 차용 → company L3 승인 → 다음 사이클 참여
   - _Requirements: R13_
-  - _차단: 16.0 (desktop 저장소 변경 승인 필요)_
+  - _의존: 16.0 완료 — 게이트 훅이 desktop 에 붙어 있다_
   - _업스트림: agentlas-desktop `electron/{cloud-agents,marketplace}/`, `Agentlas-OS`_
 
 - [ ] 17. 무인 운영과 침해 복구
