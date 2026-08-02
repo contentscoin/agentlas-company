@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Channel } from '../verbs/types.js';
 import type { PublishEvidence } from './types.js';
+import { ensurePrivateDir, writePrivateFile } from '../zones/private.js';
 
 interface Record_ {
   key: string;
@@ -49,7 +50,7 @@ export class PublishStore {
   constructor(opts: PublishStoreOptions) {
     this.file = opts.file;
     this.now = opts.now ?? Date.now;
-    mkdirSync(dirname(this.file), { recursive: true });
+    ensurePrivateDir(dirname(this.file));
   }
 
   /**
@@ -71,7 +72,7 @@ export class PublishStore {
   }
 
   private save(data: FileShape): void {
-    writeFileSync(this.file, JSON.stringify(data, null, 2), 'utf8');
+    writePrivateFile(this.file, JSON.stringify(data, null, 2));
   }
 
   get damaged(): boolean {

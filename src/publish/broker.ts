@@ -4,12 +4,18 @@
  * 순서가 설계다.
  *
  *   1. 오염 확인        신뢰등급 0 에서 나온 발행은 거부      R16.5
- *   2. 멱등성 확인      이미 나갔으면 원래 증거를 돌려준다     R6.3
- *   3. 일일 상한 확인   넘으면 정지하고 오너에게 알린다        R6.5
- *   4. 어댑터 준비 확인 토큰·프로필이 없으면 여기서 멈춘다
- *   5. 드라이런이면 페이로드만 돌려주고 끝                     R6.4
- *   6. 게이트          승인 없이 나가지 않는다                R4
- *   7. 발행 + 증거 기록                                       R6.2
+ *   2. 비밀·PII 린트    검출되면 차단, 값은 보고하지 않는다     R15.5, R15.6
+ *   3. 멱등성 확인      이미 나갔으면 원래 증거를 돌려준다     R6.3
+ *   4. 일일 상한 확인   넘으면 정지하고 오너에게 알린다        R6.5
+ *   5. 어댑터 준비 확인 토큰·프로필이 없으면 여기서 멈춘다
+ *   6. 드라이런이면 페이로드만 돌려주고 끝                     R6.4
+ *   7. 게이트          승인 없이 나가지 않는다                R4
+ *   8. 발행 + 증거 기록                                       R6.2
+ *
+ * **린트가 멱등성보다 앞이다.** 뒤에 두면 이미 나간 발행의 재확인이 린트에
+ * 걸려 duplicate 로 답하지 못한다. 그리고 린트는 드라이런에도 적용한다 —
+ * 드라이런 출력은 로그와 원장으로 흘러가므로 "실제로 안 나가니까 괜찮다" 가
+ * 성립하지 않는다.
  *
  * **멱등성이 상한보다 앞이다.** 뒤에 두면 이미 나간 발행의 재시도가 상한에
  * 걸려 실패하고, 호출자는 "발행됐나 안 됐나" 를 알 수 없게 된다. 이미 나간
@@ -28,6 +34,7 @@ import type { ApprovalService } from '../policy/approval.js';
 import type { PolicyConfig } from '../policy/types.js';
 import { resolveGate } from '../policy/gate.js';
 import type { Channel } from '../verbs/types.js';
+import { describeFinding, lint } from '../zones/lint.js';
 import { PublishStore } from './ledgerstore.js';
 import {
   DEFAULT_DAILY_LIMITS,
@@ -48,6 +55,16 @@ export interface PublishBrokerOptions {
   dailyLimits?: Partial<Record<Channel, number>>;
   /** 상한 도달을 오너에게 알린다 (R6.5). */
   notify?: (message: string) => void;
+}
+
+/** 동사에서 밖으로 나갈 텍스트를 모은다. 린트 대상이다 (R15.5). */
+export function outboundText(verb: { op: string } & Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const key of ['body', 'caption']) {
+    const value = verb[key];
+    if (typeof value === 'string') parts.push(value);
+  }
+  return parts.join('\n');
 }
 
 /** 발행 페이로드의 digest. 승인은 이 값에 묶인다 (R4.6). */
@@ -110,7 +127,26 @@ export class PublishBroker {
       ]);
     }
 
-    // 2 — 멱등성. 이미 나갔으면 그 증거를 그대로 돌려준다 (R6.3).
+    // 2 — 비밀·PII 린트 (R15.5). 오염 검사 바로 뒤다.
+    //
+    // 드라이런에도 적용한다. 드라이런 출력은 로그·원장·오너 폰으로 흘러가므로
+    // "실제로 안 나가니까 괜찮다" 가 성립하지 않는다.
+    const scan = lint(outboundText(req.verb as never), req.channel);
+    if (!scan.ok) {
+      // 검출 내역은 종류와 위치만 남긴다 (R15.6). 값은 어디에도 싣지 않는다.
+      return this.fail(
+        req,
+        'secret-detected',
+        scan.findings.map(describeFinding).join('; '),
+        [
+          '본문에서 아래 항목을 제거한 뒤 다시 시도하세요:',
+          ...scan.findings.map(describeFinding),
+          '검출된 값은 보고에 담기지 않습니다 — 원문을 직접 확인하세요',
+        ],
+      );
+    }
+
+    // 3 — 멱등성. 이미 나갔으면 그 증거를 그대로 돌려준다 (R6.3).
     const already = this.opts.store.find(req.idempotencyKey);
     if (already) {
       this.opts.ledger.append({
@@ -131,7 +167,7 @@ export class PublishBroker {
       };
     }
 
-    // 3 — 일일 상한 (R6.5).
+    // 4 — 일일 상한 (R6.5).
     const used = this.opts.store.countToday(req.channel);
     const cap = this.limit(req.channel);
     if (used >= cap) {
@@ -141,13 +177,13 @@ export class PublishBroker {
       ]);
     }
 
-    // 4 — 어댑터가 실제로 나갈 수 있는가.
+    // 5 — 어댑터가 실제로 나갈 수 있는가.
     const ready = adapter.ready();
     if (!ready.ok) {
       return this.fail(req, 'not-configured', ready.reason, ready.checklist);
     }
 
-    // 5 — 드라이런은 여기서 끝. 아무것도 바꾸지 않으므로 승인이 필요 없다 (R6.4).
+    // 6 — 드라이런은 여기서 끝. 아무것도 바꾸지 않으므로 승인이 필요 없다 (R6.4).
     if (req.dryRun === true) {
       return {
         ok: true,
@@ -157,7 +193,7 @@ export class PublishBroker {
       };
     }
 
-    // 6 — 게이트. 발행은 비가역이므로 최소 L3 이다.
+    // 7 — 게이트. 발행은 비가역이므로 최소 L3 이다.
     const digest = publishDigest(req);
     const decision = resolveGate(
       { policy: this.opts.policy, approvals: this.opts.approvals, ledger: this.opts.ledger },
@@ -174,7 +210,7 @@ export class PublishBroker {
       ]);
     }
 
-    // 7 — 발행.
+    // 8 — 발행.
     const runId = req.runId ?? req.idempotencyKey;
     const evidenceDir = join(this.opts.evidenceRoot, runId);
     mkdirSync(evidenceDir, { recursive: true });

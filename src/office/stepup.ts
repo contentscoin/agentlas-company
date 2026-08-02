@@ -20,6 +20,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DeviceRecord } from './tokens.js';
+import { ensurePrivateDir, writePrivateFile } from '../zones/private.js';
 
 export type StepUpVerdict = { ok: true } | { ok: false; reason: string };
 
@@ -120,7 +121,7 @@ export class TotpStepUp implements StepUpVerifier {
     this.file = opts.file;
     this.now = opts.now ?? Date.now;
     this.skew = opts.skew ?? 1;
-    mkdirSync(dirname(this.file), { recursive: true });
+    ensurePrivateDir(dirname(this.file));
   }
 
   private load(): EnrollmentFile {
@@ -135,7 +136,7 @@ export class TotpStepUp implements StepUpVerifier {
   }
 
   private save(data: EnrollmentFile): void {
-    writeFileSync(this.file, JSON.stringify(data, null, 2), 'utf8');
+    writePrivateFile(this.file, JSON.stringify(data, null, 2));
   }
 
   /** 기기에 두 번째 요소를 등록한다. 반환한 secret 은 한 번만 보여준다. */

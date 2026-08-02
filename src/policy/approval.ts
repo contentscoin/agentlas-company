@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Ledger } from '../ledger/ledger.js';
+import { ensurePrivateDir, writePrivateFile } from '../zones/private.js';
 import type {
   ApprovalOutcome,
   ApprovalRequest,
@@ -57,7 +58,7 @@ export class ApprovalService {
     this.file = opts.file;
     this.notify = opts.notify ?? ((): void => {});
     this.now = opts.now ?? Date.now;
-    if (this.file) mkdirSync(dirname(this.file), { recursive: true });
+    if (this.file) ensurePrivateDir(dirname(this.file));
     this.load();
   }
 
@@ -90,7 +91,7 @@ export class ApprovalService {
 
   private persist(): void {
     if (!this.file) return;
-    writeFileSync(this.file, JSON.stringify({ requests: [...this.requests.values()] }, null, 2), 'utf8');
+    writePrivateFile(this.file, JSON.stringify({ requests: [...this.requests.values()] }, null, 2));
   }
 
   /** 만료를 정리한다. 만료는 취소이며 통과가 아니다 (R4.7). */

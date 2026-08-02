@@ -48,6 +48,8 @@ export type PublishFailure =
   | 'tainted'
   | 'capability-off'
   | 'adapter-failed'
+  /** 본문에서 비밀·PII 가 검출됐다 (R15.5). */
+  | 'secret-detected'
   | 'not-configured';
 
 export interface PublishResult {

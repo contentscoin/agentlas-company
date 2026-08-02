@@ -38,6 +38,7 @@ import {
   type VerifyProblem,
   type VerifyResult,
 } from './types.js';
+import { ensurePrivateDir, tightenFile } from '../zones/private.js';
 
 /** 해시 계산용 정규 직렬화. 키 순서를 고정해야 해시가 재현된다. */
 export function canonicalize(event: Omit<LedgerEvent, 'hash'>): string {
@@ -83,7 +84,7 @@ export class Ledger {
    * 기존 파일이 있으면 마지막 온전한 이벤트에서 이어 쓴다.
    */
   static open(file: string): Ledger {
-    mkdirSync(dirname(file), { recursive: true });
+    ensurePrivateDir(dirname(file));
     if (!existsSync(file)) return new Ledger(file, 0, GENESIS_HASH);
 
     const events = readEvents(file);
@@ -155,6 +156,9 @@ export class Ledger {
     // 한 줄씩 append 하고 fsync 한다.
     // 정전 후 원장 무손실(R17.2)을 확인할 수 있어야 하므로 버퍼에 두지 않는다.
     appendFileSync(this.file, JSON.stringify(event) + '\n', 'utf8');
+    // append 는 mode 를 못 준다. 원장이 처음 만들어진 직후 한 번 조인다 —
+    // 여기서 조이지 않으면 첫 실행부터 스크립트를 돌릴 때까지 열려 있다.
+    tightenFile(this.file);
     const fd = openSync(this.file, 'r+');
     try {
       fsyncSync(fd);

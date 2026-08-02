@@ -37,6 +37,9 @@ import { PublishStore } from './publish/ledgerstore.js';
 import { NaverBlogAdapter } from './publish/adapters/naver-blog.js';
 import { ThreadsAdapter } from './publish/adapters/threads.js';
 import { parseVerb } from './verbs/parse.js';
+import { zoneLayout } from './zones/layout.js';
+import { currentAccount, verifyZones } from './zones/verify.js';
+import { describeFinding, lint } from './zones/lint.js';
 import { DEFAULT_VERB_POLICY } from './verbs/types.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
@@ -969,6 +972,99 @@ async function cmdPublish(argv: string[]): Promise<number> {
   return EXIT_OK;
 }
 
+/**
+ * 구역 검증과 비밀 린트 (R15).
+ *
+ * 하위 명령: `verify`(기본), `lint <파일>`
+ */
+function cmdSecurity(argv: string[]): number {
+  const sub = subcommand(argv) ?? 'verify';
+
+  if (sub === 'lint') {
+    const target = argv[2];
+    if (!target) {
+      process.stderr.write('사용법: company security lint <파일>\n');
+      return EXIT_CANNOT_RUN;
+    }
+    let text: string;
+    try {
+      text = readFileSync(target, 'utf8');
+    } catch (err) {
+      process.stderr.write(`읽지 못했습니다: ${(err as Error).message}\n`);
+      return EXIT_CANNOT_RUN;
+    }
+    const result = lint(text, target);
+    if (hasFlag(argv, '--json')) {
+      // 값은 담기지 않는다 (R15.6). Finding 에 담을 필드 자체가 없다.
+      jsonOut(result);
+      return result.ok ? EXIT_OK : EXIT_FINDING;
+    }
+    if (result.ok) {
+      out(`${target} — 검출 없음`);
+      return EXIT_OK;
+    }
+    out(`${target} — ${result.findings.length}건 검출`);
+    for (const f of result.findings) out(`  ${describeFinding(f)}`);
+    out('');
+    out('검출된 값은 출력하지 않습니다 (R15.6). 위치를 보고 원문을 확인하세요.');
+    return EXIT_FINDING;
+  }
+
+  if (sub !== 'verify') {
+    process.stderr.write(`알 수 없는 하위 명령: ${sub}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const state = resolveState();
+  const entries = zoneLayout(state);
+  const report = verifyZones({
+    entries,
+    candidatePaths: entries.map((e) => e.path),
+  });
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut({ account: currentAccount(), ...report });
+    return report.ok ? EXIT_OK : EXIT_FINDING;
+  }
+
+  out(`구역 검증 — ${report.platform}, 현재 계정 ${currentAccount()}`);
+  out('');
+  out('판정    자산                     경로');
+  out('-'.repeat(78));
+  const mark: Record<string, string> = {
+    ok: '닫힘',
+    violation: '열림!',
+    unknown: '미확인',
+    absent: '없음',
+  };
+  for (const row of report.rows) {
+    out(`${(mark[row.verdict] ?? row.verdict).padEnd(7)} ${row.label.padEnd(24)} ${row.path}`);
+    if (row.verdict !== 'ok') out(`        └ ${row.detail}`);
+  }
+  out('');
+  out(
+    `닫힘 ${report.counts.ok} · 열림 ${report.counts.violation} · ` +
+      `미확인 ${report.counts.unknown} · 없음 ${report.counts.absent}`,
+  );
+
+  if (report.forbidden.length > 0) {
+    out('');
+    out('이 기계에 있어서는 안 되는 파일 (R15.7):');
+    for (const f of report.forbidden) out(`  ${f.path} — ${f.detail}`);
+  }
+
+  if (report.counts.unknown > 0) {
+    out('');
+    out('미확인은 통과가 아닙니다. 확인하지 못한 것을 닫혔다고 보고하지 않습니다.');
+  }
+  if (report.platform !== 'win32') {
+    out('');
+    out('운영 대상은 Windows 입니다. 여기 판정은 POSIX 모드 기준이며,');
+    out('실제 배치에서는 setup-zones.ps1 적용 후 다시 확인하세요.');
+  }
+  return report.ok ? EXIT_OK : EXIT_FINDING;
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
   const sub = subcommand(argv);
@@ -1082,6 +1178,10 @@ function usage(): void {
   out('  company publish --verb <동사.json> [--key <멱등키>] [--dry-run]');
   out('      동사는 파일로만 받습니다. 자유 텍스트를 받는 인자는 없습니다');
   out('');
+  out('  구역·비밀 (R15) — 좌석은 브로커 자산을 보지 못한다');
+  out('  company security verify          권한 표와 실제 권한을 대조');
+  out('  company security lint <파일>     비밀·PII 검출 (값은 출력하지 않음)');
+  out('');
   out('  회의 (R3) — 2라운드 턴제, Critic 은 다른 벤더 좌석');
   out('  company meeting --agenda "안건" [--attendees cto,growth] [--companyctl <경로>]');
   out('');
@@ -1118,6 +1218,8 @@ async function main(): Promise<number> {
         return await cmdOffice(argv);
       case 'publish':
         return await cmdPublish(argv);
+      case 'security':
+        return cmdSecurity(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':

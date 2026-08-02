@@ -16,6 +16,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Ledger } from '../ledger/ledger.js';
+import { ensurePrivateDir, writePrivateFile } from '../zones/private.js';
 
 export type DeviceKind = 'desktop' | 'mobile';
 
@@ -54,7 +55,7 @@ export class DeviceStore {
     this.file = opts.file;
     this.ledger = opts.ledger;
     this.now = opts.now ?? Date.now;
-    mkdirSync(dirname(this.file), { recursive: true });
+    ensurePrivateDir(dirname(this.file));
   }
 
   /**
@@ -79,7 +80,7 @@ export class DeviceStore {
   }
 
   private save(devices: DeviceRecord[]): void {
-    writeFileSync(this.file, JSON.stringify({ devices }, null, 2), 'utf8');
+    writePrivateFile(this.file, JSON.stringify({ devices }, null, 2));
   }
 
   list(): DeviceRecord[] {
