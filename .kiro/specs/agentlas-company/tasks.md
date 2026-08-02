@@ -14,7 +14,7 @@
 | 태스크 | 처리 | 근거 |
 |---|---|---|
 | 9 발행 | **자체 구현 유지** | desktop 에 채널 발행 구현 없음 |
-| 10 Hands | **desktop 연동** | `computer-use` 제어 서버 계약 존재 |
+| 10 Hands | **desktop 연동** | 브라우저 CDP 런처 (computer-use 는 macOS 전용 — 8/2 정정) |
 | 11 Studio | **범위 축소** | desktop Studio 는 `ipcMain` 뒤 — 헤드리스 미도달 |
 | 14 오피스·모바일 | **desktop 연동** | `mobile-bridge` 12개 모듈, main.ts 기동 확인 |
 | 16 채용 | **desktop 연동 + 선행조건** | Hub 는 있으나 게이트 훅이 desktop 변경을 요구 |
@@ -22,8 +22,10 @@
 
 연동 범위를 정한 것은 헤드리스 도달성입니다. desktop 기능 대부분이 `electron/ipc.ts` 의
 `ipcMain.handle` **486개** 뒤에 있어 Electron 렌더러에서만 호출됩니다. 밖으로 나온 표면은
-`computer-use/control-server` · `mobile-bridge/server` · `browser/approval-server` ·
-`mcp-tools/registry` 넷뿐이고, 이 넷이 연동 가능 범위의 전부입니다.
+`mcp-tools/browser-cdp-launcher`(MCP stdio) · `mobile-bridge/server` ·
+`browser/approval-server` · `mcp-tools/registry` 이고, 이것이 연동 가능 범위의 전부입니다.
+`computer-use/control-server` 도 밖으로 나와 있지만 **macOS 전용**이라 Windows 대상에서는
+쓰지 못합니다 (Task 10 항목의 정정 참조).
 
 **주의 — 순서가 바뀌었습니다.** 이전 권고는 "Task 9 먼저"였습니다. 재정의 후 Task 9 는
 Task 10(네이버 블로그 Hands 경로)에 의존하고, L3 비가역 작업인 실제 발행은 8.1 단계별
@@ -139,28 +141,50 @@ Task 10(네이버 블로그 Hands 경로)에 의존하고, L3 비가역 작업�
     `threads`·`instagram` 은 `experience/taxonomy.ts`·`mcp-tools/catalog.ts` 의 문자열이다
   - `PublishRequest` 계약, `idempotencyKey` 멱등성, 드라이런, 채널 일일 상한
   - 쓰레드(OAuth API)와 네이버 블로그(Hands)를 각각 하나씩 살려 경로 추상화 검증
-  - 네이버 블로그 경로는 Task 10 의 `DesktopHandsAdapter` 를 쓴다 → **Task 10 이 선행**
+  - 네이버 블로그 경로는 Task 10 의 `HandsExecutor`(브라우저 CDP)를 쓴다 → **Task 10 선행**
+  - R7.6(스마트스토어 집계값 전용)과 R7.2(단계별 스크린샷 증거)를 여기서 마감한다
   - 시연: 기획 → 초안 → 승인 → 실제 발행 완주, 원장에 URL 증거. **첫 성과 발생 지점**
   - _Requirements: R6_
   - _의존: Task 10 (Hands 경로), Task 14 또는 8.1 (L3 실물 인증 — 아래 주의 참조)_
 
-- [ ] 10. Hands — desktop computer-use 연동
-  - **재정의(2026-08-02)**: CDP 브라우저 조작과 네이티브 입력을 자체 구현하지 않는다.
-    `agentlas-desktop` 이 이미 가진 표면에 붙는다. 설계 §agentlas-desktop 경계 참조
-  - `DesktopHandsAdapter` — 제어 파일 `<userData>/computer-use/control.json` 을 읽고
-    (`{ schemaVersion, port, token }`, mode 0600) loopback HTTP 에 `Bearer <token>` 으로 호출
-  - `schemaVersion !== 1` 이면 실행하지 않고 실패한다. 미지원 버전을 추정으로 진행하지 않는다
-  - 도구 16종(`computer_status`·`focus_app`·`click`·`type_text`·`press_key` 등)을 타입 지정
-    동사로 감싼다. 자유 텍스트가 desktop 으로 넘어가는 경로를 만들지 않는다 (Z2→Z1 규칙)
-  - desktop 미기동·제어 파일 부재·토큰 불일치는 각각 다른 실패로 구분한다. 조용한 성공 금지
-  - 모든 호출과 거부를 원장에 기록. 오염된 입력은 스위치가 켜져 있어도 거부 (R16.5)
-  - 스마트스토어 집계값 전용 규칙은 company 쪽 동사 계약에서 강제한다 (R7.6 — desktop 은 모른다)
-  - 반자동 체크리스트 폴백은 유지 — desktop 이 요소를 못 찾으면 사람이 이어받는다 (R7.5)
-  - 시연: `company hands` 가 desktop 을 통해 실제 조작 1건 수행, 원장에 증거
-  - [ ] 10.1 desktop 미설치 환경의 동작 확정 — 현재 미정. Hands 스텝을 실패로 막을지,
+- [x] 10. Hands — desktop 브라우저 CDP 런처 연동
+  - **재정의 정정(2026-08-02).** 8/2 1차 재정의는 `computer-use` 제어 서버에 붙는다고
+    적었다. **틀렸다.** 실제 소스 확인 결과 그 표면은 **macOS 전용**이다 —
+    `control-server.ts:236` 이 `process.platform !== 'darwin'` 이면 서버를 아예 띄우지
+    않고, `native-driver.ts:47` 도 같으며, `native/` 에는 `macos` 만 있다.
+    우리 운영 대상은 Windows 다(설계 §Windows 배치, CI 매트릭스 windows-latest 1순위).
+    **그 계획대로 만들었다면 대상 플랫폼에서 한 줄도 돌지 않았다.**
+  - 대신 붙은 곳: desktop 이 물질화하는 `~/.agentlas/agentlas-browser-cdp.mjs`.
+    `@playwright/mcp` 앞에 선 MCP stdio 프록시이며 **크로스플랫폼**이고, 원래 태스크
+    문구가 요구한 "전용 브라우저 프로필 + CDP" 바로 그것이다. Task 9 의 네이버 블로그
+    발행이 필요로 하는 것도 네이티브 입력이 아니라 이 경로다
+  - `src/hands/types.ts` — 동사 8종만 노출하는 **닫힌 목록**. `browser_evaluate`(임의 JS),
+    `browser_cookie_*`·`browser_localstorage_*`(자격증명 표면), `browser_mouse_*_xy`(좌표
+    조작)는 의도적으로 제외하고 제외 이유를 주석으로 고정했다
+  - `src/hands/parse.ts` — 문자열 입력 즉시 거부(R16.7), 알 수 없는 필드 거부,
+    URL 은 **파싱된 호스트**로 허용목록 대조(R7.4). `evil.com/?next=blog.naver.com` 같은
+    문자열 포함 우회를 막는다
+  - `src/hands/locate.ts` — 실패 사유를 구분한다: `launcher-missing` / `chrome-missing` /
+    `desktop-not-running` / `node-missing`. 오너가 해야 할 일이 각각 다르다
+  - `src/hands/mcp.ts` — 최소 MCP stdio 클라이언트(initialize·tools/list·tools/call).
+    무응답은 타임아웃으로 실패하며 성공이 되지 않는다. 종료는 `proc.killTree`
+  - `src/hands/executor.ts` — 오염 계획 거부 → 게이트 → 단계 실행 → 원장.
+    실패 시 남은 단계를 사람이 이어받을 체크리스트로 산출(R7.5)
+  - 조작 하나에 게이트가 둘이다 — company 승인 게이트와, 런처가 결제·게시·삭제에
+    대해 desktop 승인 UI 로 거는 게이트
+  - **미완**: 실제 브라우저 조작 시연. 이 컨테이너에 Chrome·desktop 이 없어 표면 점검이
+    `chrome-missing, desktop-not-running` 으로 정확히 막는 것까지만 확인했다.
+    **오너 기계에서 1회 실행이 남아 있다**
+  - **미구현**: R7.2 단계별 스크린샷 증거는 도구 보고의 digest 만 남긴다. 이미지 파일
+    보존은 실제 브라우저 왕복을 보고 정해야 해서 열어 뒀다
+  - **미구현**: R7.6 스마트스토어 집계값 전용. 읽기 동사가 아직 없어 Task 9 에서 붙인다
+  - _Requirements: R7.1, R7.3, R7.4, R7.5 (R7.2·R7.6 은 위 미구현 참조)_
+  - _업스트림: agentlas-desktop `electron/mcp-tools/browser-cdp-launcher.ts`, `electron/browser/`_
+
+  - [ ] 10.1 오너 기계에서 실제 조작 1회 실행 — Chrome·desktop 이 있는 환경에서
+        `company hands --plan` 완주 확인. 여기서 R7.2 증거 형식도 확정한다
+  - [ ] 10.2 desktop 미설치 환경의 동작 확정 — 지금은 `surface-unavailable` 로 막는다.
         체크리스트 폴백으로 강등할지는 Task 9 실사용 후 결정
-  - _Requirements: R7_
-  - _업스트림: agentlas-desktop `electron/computer-use/{control-server,channel,mcp-server}.ts`_
 
 - [ ] 11. Studio — 좌석 산출 + desktop 표면 (범위 축소)
   - **재정의(2026-08-02)**: desktop 의 Studio 계열(`creative-pack/`·`document/`·`oberon/`·

@@ -82,14 +82,21 @@ flowchart TB
 
 **연동 가능 범위는 헤드리스 도달성이 정합니다.** desktop 기능의 대부분은 `electron/ipc.ts` 의 `ipcMain.handle` **486개** 뒤에 있고, 이건 Electron 렌더러에서만 호출됩니다. company 는 헤드리스 CLI이므로 닿지 않습니다. 밖으로 나온 표면은 넷뿐입니다.
 
-| desktop 표면 | 프로토콜 | company 쪽 소비자 |
-|---|---|---|
-| `computer-use/control-server.ts` | loopback HTTP + `Authorization: Bearer` | Hands Executor (Task 10) |
-| `mobile-bridge/server.ts` | HTTPS/WSS + 페어링 + authority | 오피스 API·모바일 승인 (Task 14) |
-| `browser/approval-server.ts` | loopback HTTP | 승인 흐름 보조 (Task 7) |
-| `mcp-tools/registry.ts` | 외부 MCP 등록 (stdio/sse/http) | company 를 도구로 등록 (Task 16) |
+| desktop 표면 | 프로토콜 | 플랫폼 | company 쪽 소비자 |
+|---|---|---|---|
+| `mcp-tools/browser-cdp-launcher.ts` | MCP stdio (`@playwright/mcp` 프록시) | 전부 | **Hands Executor (Task 10)** |
+| `mobile-bridge/server.ts` | HTTPS/WSS + 페어링 + authority | 전부 | 오피스 API·모바일 승인 (Task 14) |
+| `browser/approval-server.ts` | loopback HTTP | 전부 | 런처가 직접 호출 (민감 행동 승인) |
+| `mcp-tools/registry.ts` | 외부 MCP 등록 (stdio/sse/http) | 전부 | company 를 도구로 등록 (Task 16) |
+| `computer-use/control-server.ts` | loopback HTTP + Bearer | **macOS 전용** | 없음 — 아래 참조 |
 
-computer-use 의 계약은 정확합니다. 제어 파일 `<userData>/computer-use/control.json` 이 `{ schemaVersion: 1, port, token }` 을 mode `0600` 으로 쓰고, 환경변수 `AGENTLAS_COMPUTER_USE_CONTROL_FILE` 이 그 경로를 가리키며, 도구는 16종(`computer_status`, `click`, `type_text`, `press_key` 등)입니다. Task 10 은 이 계약에 바인딩하고 desktop 내부 구현에는 의존하지 않습니다 — Python 업스트림을 `--json` 계약으로만 소비하는 것과 같은 규칙입니다.
+**computer-use 는 macOS 전용입니다.** `control-server.ts:236` 이 `process.platform !== 'darwin'` 이면 서버를 띄우지 않고, `native-driver.ts:47` 도 같으며 `native/` 에는 `macos` 만 있습니다. 우리 운영 대상은 Windows(§Windows 배치)이므로 이 표면은 **쓰지 않습니다.** 1차 재정의(2026-08-02)는 Task 10 을 여기 붙인다고 적었고 그것은 틀렸습니다 — 그대로 만들었다면 대상 플랫폼에서 한 줄도 돌지 않았을 것입니다.
+
+Hands 가 실제로 붙는 곳은 desktop 이 `~/.agentlas/agentlas-browser-cdp.mjs` 로 물질화하는 CDP 런처입니다. 의존성 0 의 순수 node 스크립트이고, 전용 Chrome 프로필(`~/.agentlas/chrome-cdp-profile`)을 원격 디버깅 포트로 띄운 뒤 `@playwright/mcp` 를 CDP 로 붙입니다. 로그인 세션이 유지된 전용 프로필이라는 점이 R7.1 그 자체이고, 신선한 임시 프로필이 봇 차단에 걸리는 문제를 desktop 이 이미 풀어 놓았습니다.
+
+**조작 하나에 게이트가 둘입니다.** company 의 승인 게이트를 통과해도, 런처가 결제·게시·삭제·임의코드를 감지하면 desktop 승인 UI 로 다시 막습니다. 런처는 현재 페이지 URL 을 CDP 로 확인할 수 없으면 민감 행동을 진행하지 않습니다(fail-closed). 우리 게이트를 지나 desktop 게이트에서 멈추는 것은 정상 동작이며, 실행기는 그것을 `step-failed` 로 보고하고 체크리스트를 냅니다.
+
+Hands 가 노출하는 동사는 8종뿐입니다. `@playwright/mcp` 의 도구는 훨씬 많지만 전부 열지 않습니다 — `browser_evaluate`(임의 JS 실행은 자유 텍스트가 실행이 되는 바로 그 경로), `browser_cookie_*`·`browser_localstorage_*`(자격증명 표면은 좌석 구역이 읽을 것이 아닙니다, R15), `browser_mouse_*_xy`(좌표 조작은 화면이 바뀌면 조용히 엉뚱한 곳을 누릅니다). 제외 목록과 이유는 `src/hands/types.ts` 주석에 고정해 두었습니다.
 
 **MCP 등록은 집행이 아닙니다.** desktop 의 외부 MCP 레지스트리에 company 를 stdio 서버로 올리면 desktop 안의 에이전트가 원장 기록·승인 요청을 **할 수 있게** 됩니다. 하지만 desktop 자신의 동작이 우리 게이트를 **거치지는** 않습니다. MCP 는 도구를 제공하지 호출을 가로채지 않습니다. 이 구분을 흐리면 "초록인데 틀린 상태"가 됩니다 — 원장에 기록은 쌓이는데 아무것도 막지 못하는 상태.
 

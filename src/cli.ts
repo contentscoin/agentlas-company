@@ -12,6 +12,7 @@
  */
 
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { Ledger } from './ledger/ledger.js';
 import type { EventKind, QueryFilter } from './ledger/types.js';
 import { SeatBroker } from './seats/broker.js';
@@ -24,6 +25,9 @@ import { RISKY_CAPABILITIES, isRiskyCapability, type Caller } from './capabiliti
 import { humanRemaining, parseTtl } from './capabilities/ttl.js';
 import { classify, loadPolicy } from './policy/policy.js';
 import { resolveGate } from './policy/gate.js';
+import { parseHandsPlan } from './hands/parse.js';
+import { DEFAULT_HANDS_POLICY } from './hands/types.js';
+import { HandsExecutor, planDigest } from './hands/executor.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
 import { randomUUID } from 'node:crypto';
@@ -63,6 +67,18 @@ function hasFlag(argv: string[], name: string): boolean {
 function flagValue(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
+}
+
+/**
+ * 하위 명령을 읽는다. 플래그는 하위 명령이 아니다.
+ *
+ * `argv[1]` 을 그대로 쓰면 `company approvals --json` 이 `--json` 을 하위
+ * 명령으로 읽고 "알 수 없는 하위 명령" 으로 죽는다. usage 는 `--json` 을
+ * 공통 플래그로 안내하고 있으므로 이건 계약 위반이다. Task 10 실측 중 밟았다.
+ */
+function subcommand(argv: string[]): string | undefined {
+  const value = argv[1];
+  return value === undefined || value.startsWith('--') ? undefined : value;
 }
 
 function ledgerPath(argv: string[]): string {
@@ -239,7 +255,7 @@ function ownerCaller(argv: string[]): Caller {
 
 /** 능력 스위치 (R8). */
 function cmdCaps(argv: string[]): number {
-  const sub = argv[1];
+  const sub = subcommand(argv);
   const store = capStore(argv);
 
   if (sub === undefined || sub === 'list') {
@@ -626,9 +642,99 @@ function cmdGate(argv: string[]): number {
   return decision.allowed ? EXIT_OK : EXIT_FINDING;
 }
 
+/**
+ * Hands — 브라우저 조작 (R7).
+ *
+ * 계획은 **파일로만** 받는다. 명령줄에서 자연어를 받는 인자는 없다.
+ * 계획 전체가 하나의 digest 로 승인에 묶이므로, 한 단계만 바뀌어도 승인은
+ * 다시 받아야 한다 (R4.6).
+ */
+async function cmdHands(argv: string[]): Promise<number> {
+  const planFile = flagValue(argv, '--plan');
+  if (!planFile) {
+    process.stderr.write(
+      '사용법: company hands --plan <계획.json> [--domains a.com,b.com] [--tainted] [--run <runId>]\n' +
+        '        계획은 파일로만 받습니다. 자연어 지시를 받는 인자는 없습니다.\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(planFile, 'utf8'));
+  } catch (err) {
+    process.stderr.write(`계획을 읽지 못했습니다: ${(err as Error).message}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const domains = (flagValue(argv, '--domains') ?? '').split(',').map((d) => d.trim()).filter(Boolean);
+  const parsed = parseHandsPlan(raw, { ...DEFAULT_HANDS_POLICY, allowedDomains: domains });
+  if (!parsed.ok) {
+    if (hasFlag(argv, '--json')) jsonOut({ ok: false, reason: 'invalid-plan', errors: parsed.errors });
+    else for (const e of parsed.errors) process.stderr.write(`거부: ${e}\n`);
+    return EXIT_FINDING;
+  }
+
+  const ledger = Ledger.open(ledgerPath(argv));
+  const { policy } = loadPolicy(policyFile(argv));
+  const { svc } = approvalService(argv);
+  const tainted = hasFlag(argv, '--tainted');
+  const runId = flagValue(argv, '--run') ?? randomUUID();
+  const digest = planDigest(parsed.steps);
+
+  // 게이트를 먼저 통과해야 표면에 닿는다. 오염은 게이트가 등급을 올리고,
+  // 실행기가 그와 별개로 한 번 더 막는다.
+  const decision = resolveGate(
+    { policy, approvals: svc, ledger },
+    {
+      action: 'hands.run',
+      payloadDigest: digest,
+      summary: `hands ${parsed.steps.length}단계 (${parsed.steps.map((s) => s.op).join('→')})`,
+      ...(tainted ? { tainted: true } : {}),
+      runId,
+    },
+  );
+
+  const executor = new HandsExecutor({ ledger });
+  const result = await executor.run({
+    steps: parsed.steps,
+    gateAllowed: decision.allowed,
+    ...(decision.allowed ? {} : { gateReason: decision.reason }),
+    ...(tainted ? { tainted: true } : {}),
+    runId,
+  });
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut({ runId, planDigest: digest, gate: decision, ...result });
+    return result.ok ? EXIT_OK : EXIT_FINDING;
+  }
+
+  out(`run     ${runId}`);
+  out(`계획    ${parsed.steps.length}단계  digest ${digest.slice(0, 12)}`);
+  out(`게이트  ${decision.allowed ? '인가' : `거부 — ${decision.reason}`}`);
+  for (const s of result.steps) {
+    out(`  [${s.index}] ${s.op.padEnd(14)} ${s.ok ? 'ok' : `실패 — ${s.reason ?? ''}`}`);
+  }
+  if (!result.ok) {
+    out(`결과    실패 — ${result.reason}${result.detail ? `: ${result.detail}` : ''}`);
+    for (const d of result.surface?.detail ?? []) out(`        ${d}`);
+    if (decision.approvalId && decision.reason === 'approval-pending') {
+      out(`        company approvals approve ${decision.approvalId} --digest ${digest}`);
+    }
+    if (result.checklist && result.checklist.length > 0) {
+      out('');
+      out('사람이 이어받을 단계:');
+      for (const line of result.checklist) out(`  ${line}`);
+    }
+  } else {
+    out(`결과    성공 — ${result.steps.length}단계 완료`);
+  }
+  return result.ok ? EXIT_OK : EXIT_FINDING;
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
-  const sub = argv[1];
+  const sub = subcommand(argv);
   const { svc } = approvalService(argv);
 
   if (sub === undefined || sub === 'list') {
@@ -725,6 +831,10 @@ function usage(): void {
   out('  company gate --action <작업> --digest <sha256> [--summary "..."] [--tainted]');
   out('      종료 0=인가  1=거부  2=묻지 못함. 2 를 통과로 해석하면 안 됩니다');
   out('');
+  out('  Hands (R7) — 브라우저 조작. 실행 표면은 agentlas-desktop 의 CDP 런처');
+  out('  company hands --plan <계획.json> --domains blog.naver.com [--tainted]');
+  out('      계획은 파일로만 받습니다. 자연어 지시를 받는 인자는 없습니다');
+  out('');
   out('  회의 (R3) — 2라운드 턴제, Critic 은 다른 벤더 좌석');
   out('  company meeting --agenda "안건" [--attendees cto,growth] [--companyctl <경로>]');
   out('');
@@ -755,6 +865,8 @@ async function main(): Promise<number> {
         return cmdClassify(argv);
       case 'gate':
         return cmdGate(argv);
+      case 'hands':
+        return await cmdHands(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':
