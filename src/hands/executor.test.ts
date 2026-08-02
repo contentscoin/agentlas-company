@@ -44,6 +44,22 @@ rl.on('line', (line) => {
   if (m.method === 'tools/call') {
     ${behavior === 'crash' ? 'process.exit(1);' : ''}
     ${behavior === 'silent' ? 'return;' : ''}
+    // 실제 @playwright/mcp 의 필수 필드를 흉내 낸다. 무엇이든 받아 주면
+    // 프레이밍만 검증되고 도구 계약은 검증되지 않는다 — Task 9 에서
+    // ref/target 매핑 버그가 그 틈으로 실제 브라우저까지 갔다.
+    const REQUIRED = {
+      browser_navigate: ['url'],
+      browser_click: ['target'],
+      browser_type: ['target', 'text'],
+      browser_select_option: ['target', 'values'],
+      browser_press_key: ['key'],
+    };
+    const need = REQUIRED[m.params.name] || [];
+    const missing = need.filter((k) => m.params.arguments?.[k] === undefined);
+    if (missing.length) {
+      send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'Invalid arguments for tool "' + m.params.name + '": missing ' + missing.join(', ') }], isError: true } });
+      return;
+    }
     const isError = ${behavior === 'tool-error'} && m.params.name === 'browser_click';
     send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: isError ? 'Element not found: e1' : 'ok ' + m.params.name }], isError } });
     return;
@@ -101,6 +117,19 @@ describe('planDigest', () => {
 });
 
 describe('toolArguments — 표면으로 넘어가는 것만', () => {
+  it('요소 지정은 target 필드로 나간다 — 실제 도구 계약이다', () => {
+    expect(toolArguments({ op: 'click', element: '발행', ref: 'e1' })).toEqual({
+      element: '발행',
+      target: 'e1',
+    });
+    expect(toolArguments({ op: 'type', element: '본문', ref: 'e2', text: 'x' })).toMatchObject({
+      target: 'e2',
+    });
+    expect(toolArguments({ op: 'select_option', element: 's', ref: 'e3', values: ['a'] })).toMatchObject({
+      target: 'e3',
+    });
+  });
+
   it('navigate 는 url 만 넘긴다', () => {
     expect(toolArguments({ op: 'navigate', url: 'https://x.com' })).toEqual({ url: 'https://x.com' });
   });
@@ -112,7 +141,7 @@ describe('toolArguments — 표면으로 넘어가는 것만', () => {
   it('submit 이 없으면 필드를 만들지 않는다', () => {
     expect(toolArguments({ op: 'type', element: 'a', ref: 'e1', text: 'x' })).toEqual({
       element: 'a',
-      ref: 'e1',
+      target: 'e1',
       text: 'x',
     });
   });

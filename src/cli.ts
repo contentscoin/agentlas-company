@@ -32,6 +32,12 @@ import { OfficeServer } from './office/server.js';
 import { DeviceStore } from './office/tokens.js';
 import { RefuseAllStepUp, TotpStepUp } from './office/stepup.js';
 import { PublicBindRefused } from './office/bind.js';
+import { PublishBroker } from './publish/broker.js';
+import { PublishStore } from './publish/ledgerstore.js';
+import { NaverBlogAdapter } from './publish/adapters/naver-blog.js';
+import { ThreadsAdapter } from './publish/adapters/threads.js';
+import { parseVerb } from './verbs/parse.js';
+import { DEFAULT_VERB_POLICY } from './verbs/types.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
 import { randomUUID } from 'node:crypto';
@@ -864,6 +870,105 @@ async function cmdOffice(argv: string[]): Promise<number> {
   }
 }
 
+/**
+ * 발행 (R6).
+ *
+ * 동사는 **파일로만** 받는다. `company publish --verb <파일>` 이고, 명령줄에서
+ * 자유 텍스트를 받는 인자는 없다 — Hands 와 같은 이유다 (R16.7).
+ */
+async function cmdPublish(argv: string[]): Promise<number> {
+  const verbFile = flagValue(argv, '--verb');
+  if (!verbFile) {
+    process.stderr.write(
+      '사용법: company publish --verb <동사.json> [--key <멱등키>] [--dry-run] [--tainted]\n' +
+        '        동사는 파일로만 받습니다. 자유 텍스트를 받는 인자는 없습니다.\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(verbFile, 'utf8'));
+  } catch (err) {
+    process.stderr.write(`동사를 읽지 못했습니다: ${(err as Error).message}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const domains = (flagValue(argv, '--domains') ?? '').split(',').map((d) => d.trim()).filter(Boolean);
+  const parsed = parseVerb(raw, {
+    ...DEFAULT_VERB_POLICY,
+    allowedLinkDomains: domains,
+    allowedTemplateIds: (flagValue(argv, '--templates') ?? '').split(',').filter(Boolean),
+  });
+  if (!parsed.ok) {
+    if (hasFlag(argv, '--json')) jsonOut({ ok: false, reason: 'invalid-verb', errors: parsed.errors });
+    else for (const e of parsed.errors) process.stderr.write(`거부: ${e}\n`);
+    return EXIT_FINDING;
+  }
+
+  const ledger = Ledger.open(ledgerPath(argv));
+  const { policy } = loadPolicy(policyFile(argv));
+  const { svc } = approvalService(argv);
+  const store = new PublishStore({ file: join(resolveState(), 'publish', 'published.json') });
+  const runId = flagValue(argv, '--run') ?? randomUUID();
+
+  const hands = new HandsExecutor({ ledger });
+  const writeUrl = flagValue(argv, '--write-url');
+  const broker = new PublishBroker({
+    ledger,
+    approvals: svc,
+    policy,
+    store,
+    evidenceRoot: join(resolveState(), 'evidence'),
+    adapters: [
+      new ThreadsAdapter(),
+      new NaverBlogAdapter({ hands, ...(writeUrl ? { writeUrl } : {}) }),
+    ],
+    notify: (m) => note(`  알림 → 오너: ${m}`),
+  });
+
+  const result = await broker.publish({
+    channel: parsed.verb.channel,
+    verb: parsed.verb,
+    idempotencyKey: flagValue(argv, '--key') ?? `${parsed.verb.channel}:${runId}`,
+    ...(hasFlag(argv, '--dry-run') ? { dryRun: true } : {}),
+    ...(hasFlag(argv, '--tainted') ? { tainted: true } : {}),
+    runId,
+  });
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut({ runId, ...result });
+    return result.ok ? EXIT_OK : EXIT_FINDING;
+  }
+
+  out(`채널    ${result.channel}`);
+  out(`멱등키  ${result.idempotencyKey}`);
+  if (result.payload !== undefined) {
+    out('드라이런 — 실제로 나가지 않았습니다. 최종 페이로드:');
+    out(JSON.stringify(result.payload, null, 2));
+    return EXIT_OK;
+  }
+  if (result.reason === 'duplicate') {
+    out('이미 발행됨 — 다시 내보내지 않았습니다');
+    if (result.original?.url) out(`  ${result.original.url}`);
+    return EXIT_OK;
+  }
+  if (!result.ok) {
+    out(`결과    실패 — ${result.reason}${result.detail ? `: ${result.detail}` : ''}`);
+    if (result.checklist && result.checklist.length > 0) {
+      out('');
+      out('사람이 이어받을 단계:');
+      for (const line of result.checklist) out(`  ${line}`);
+    }
+    return EXIT_FINDING;
+  }
+  out('결과    발행 완료');
+  if (result.evidence?.url) out(`  URL         ${result.evidence.url}`);
+  for (const shot of result.evidence?.screenshots ?? []) out(`  스크린샷    ${shot}`);
+  for (const n of result.evidence?.notes ?? []) out(`  ${n}`);
+  return EXIT_OK;
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
   const sub = subcommand(argv);
@@ -973,6 +1078,10 @@ function usage(): void {
   out('  company office device list | revoke <ID>');
   out('  company office enroll <기기ID>                  단계별 인증(TOTP) 등록');
   out('');
+  out('  발행 (R6) — OAuth API 든 브라우저 조작이든 같은 계약');
+  out('  company publish --verb <동사.json> [--key <멱등키>] [--dry-run]');
+  out('      동사는 파일로만 받습니다. 자유 텍스트를 받는 인자는 없습니다');
+  out('');
   out('  회의 (R3) — 2라운드 턴제, Critic 은 다른 벤더 좌석');
   out('  company meeting --agenda "안건" [--attendees cto,growth] [--companyctl <경로>]');
   out('');
@@ -1007,6 +1116,8 @@ async function main(): Promise<number> {
         return await cmdHands(argv);
       case 'office':
         return await cmdOffice(argv);
+      case 'publish':
+        return await cmdPublish(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':

@@ -17,10 +17,24 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface, type Interface } from 'node:readline';
 import { killTree } from '../proc/index.js';
 
+export interface McpImage {
+  /** base64 원본. */
+  data: string;
+  mimeType: string;
+}
+
 export interface McpToolResult {
   ok: boolean;
   /** 도구가 돌려준 텍스트 조각을 이어 붙인 것. */
   text: string;
+  /**
+   * 도구가 돌려준 이미지. `browser_take_screenshot` 이 여기로 온다.
+   *
+   * 텍스트 블록에도 파일 경로가 실려 오지만 그것은 playwright 의 임시
+   * 디렉터리를 가리킨다. 증거로 남기려면 우리가 바이트를 받아 우리 자리에
+   * 써야 한다 — 남의 임시 파일을 증거라고 부를 수는 없다 (R7.2).
+   */
+  images: McpImage[];
   /** MCP `isError` 플래그. 전송은 성공했지만 도구가 실패한 경우다. */
   toolError: boolean;
 }
@@ -150,17 +164,24 @@ export class McpClient {
     const msg = await this.request('tools/call', { name, arguments: args });
     if (msg.error) {
       const err = msg.error as { message?: unknown };
-      return { ok: false, toolError: false, text: String(err.message ?? 'MCP 오류') };
+      return { ok: false, toolError: false, text: String(err.message ?? 'MCP 오류'), images: [] };
     }
     const result = msg.result as
-      | { content?: Array<{ type?: string; text?: unknown }>; isError?: unknown }
+      | {
+          content?: Array<{ type?: string; text?: unknown; data?: unknown; mimeType?: unknown }>;
+          isError?: unknown;
+        }
       | undefined;
-    const text = (result?.content ?? [])
+    const content = result?.content ?? [];
+    const text = content
       .filter((c) => c.type === 'text' && typeof c.text === 'string')
       .map((c) => c.text as string)
       .join('\n');
+    const images = content
+      .filter((c) => c.type === 'image' && typeof c.data === 'string')
+      .map((c) => ({ data: c.data as string, mimeType: String(c.mimeType ?? 'image/png') }));
     const toolError = result?.isError === true;
-    return { ok: !toolError, toolError, text };
+    return { ok: !toolError, toolError, text, images };
   }
 
   close(): void {

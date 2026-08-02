@@ -70,6 +70,27 @@ export interface Click {
   ref: string;
 }
 
+/**
+ * 같은 세션의 직전 스냅샷에서 요소를 찾아 달라는 표기.
+ *
+ * `ref` 는 **세션 안에서만** 유효하다. 정찰(스냅샷)과 조작을 두 번의 실행으로
+ * 나누면 두 번째 세션에서 그 ref 는 존재하지 않는다 — Task 9 에서 실제
+ * 브라우저가 "Ref f1e3 not found in the current page snapshot" 으로 알려줬다.
+ *
+ * 그래서 계획은 한 세션에 담고, 아직 모르는 요소는 `@find:<정규식>` 으로
+ * 적는다. 실행기가 직전 스냅샷에서 찾아 채운다. 못 찾으면 그 단계에서
+ * 멈춘다 — 비슷한 다른 것을 누르지 않는다 (R7.5).
+ */
+export const FIND_PREFIX = '@find:';
+
+export function isFindRef(ref: string): boolean {
+  return ref.startsWith(FIND_PREFIX);
+}
+
+export function findPattern(ref: string): string {
+  return ref.slice(FIND_PREFIX.length);
+}
+
 export interface TypeText {
   op: 'type';
   element: string;

@@ -17,8 +17,10 @@
  */
 
 import { createHash } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Ledger } from '../ledger/ledger.js';
-import { HANDS_TOOL, planNeedsDesktop, type HandsStep } from './types.js';
+import { HANDS_TOOL, findPattern, isFindRef, planNeedsDesktop, type HandsStep } from './types.js';
 import { inspectSurface, type Surface } from './locate.js';
 import { McpClient } from './mcp.js';
 
@@ -28,6 +30,8 @@ export interface HandsStepResult {
   ok: boolean;
   /** 도구가 돌려준 보고. 증거 digest 의 원본이다. */
   text: string;
+  /** 저장된 스크린샷 경로 (R7.2). */
+  screenshots?: string[];
   reason?: string;
 }
 
@@ -40,6 +44,8 @@ export type HandsFailure =
 
 export interface HandsRunResult {
   ok: boolean;
+  /** 이번 실행이 남긴 스크린샷 전부 (R7.2). */
+  screenshots?: string[];
   reason?: HandsFailure;
   detail?: string;
   steps: HandsStepResult[];
@@ -56,6 +62,14 @@ export interface HandsRunInput {
   /** 계획이 승인 게이트를 통과했는가. 호출자(CLI)가 `resolveGate` 로 판정한다. */
   gateAllowed: boolean;
   gateReason?: string;
+  /**
+   * 스크린샷을 저장할 디렉터리 (R7.2).
+   *
+   * 주어지면 도구가 돌려준 이미지를 여기에 쓰고 경로를 원장 증거로 남긴다.
+   * 없으면 이미지를 버린다 — 읽기 전용 탐색까지 디스크를 채울 이유는 없다.
+   * 디렉터리는 호출자가 미리 만든다.
+   */
+  evidenceDir?: string;
 }
 
 export interface HandsExecutorOptions {
@@ -86,24 +100,54 @@ export function planDigest(steps: readonly HandsStep[]): string {
     .digest('hex');
 }
 
-/** 도구 인자로 변환한다. 여기 없는 필드는 표면으로 넘어가지 않는다. */
+/**
+ * 직전 스냅샷에서 요소 ref 를 찾는다.
+ *
+ * 접근성 트리의 한 줄이 `- textbox "본문" [ref=f1e3]` 형태라, 패턴에 맞는
+ * 줄의 `[ref=...]` 를 읽는다. 첫 일치를 쓴다 — 여럿이면 계획이 모호한
+ * 것이고, 모호한 채로 아무거나 누르는 것보다 계획을 좁히는 편이 맞다.
+ */
+export function resolveRef(snapshot: string, pattern: string): string | null {
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern, 'i');
+  } catch {
+    return null;
+  }
+  for (const line of snapshot.split('\n')) {
+    if (!re.test(line)) continue;
+    const m = /\[ref=([^\]]+)\]/.exec(line);
+    if (m) return m[1] ?? null;
+  }
+  return null;
+}
+
+/**
+ * 도구 인자로 변환한다. 여기 없는 필드는 표면으로 넘어가지 않는다.
+ *
+ * **요소 지정 필드는 `target` 이다.** 처음에 `ref` 로 보냈고 타입 검사도
+ * 테스트도 통과했지만 실제 도구는 전부 거부했다 — 가짜 MCP 서버가 무엇이든
+ * 받아 주어서 프레이밍만 검증되고 도구 계약은 검증되지 않았기 때문이다.
+ * Task 9 에서 진짜 브라우저에 붙이고 나서야 잡혔다. 그 뒤로 가짜 서버도
+ * 필수 필드를 검사한다.
+ */
 export function toolArguments(step: HandsStep): Record<string, unknown> {
   switch (step.op) {
     case 'navigate':
       return { url: step.url };
     case 'click':
-      return { element: step.element, ref: step.ref };
+      return { element: step.element, target: step.ref };
     case 'type':
       return {
         element: step.element,
-        ref: step.ref,
+        target: step.ref,
         text: step.text,
         ...(step.submit === undefined ? {} : { submit: step.submit }),
       };
     case 'press_key':
       return { key: step.key };
     case 'select_option':
-      return { element: step.element, ref: step.ref, values: step.values };
+      return { element: step.element, target: step.ref, values: step.values };
     case 'wait_for':
       return {
         ...(step.text === undefined ? {} : { text: step.text }),
@@ -200,14 +244,63 @@ export class HandsExecutor {
 
     const client = this.createClient(surface);
     const steps: HandsStepResult[] = [];
+    const shots: string[] = [];
     try {
       client.start();
       await client.initialize();
 
+      let lastSnapshot = '';
       for (let i = 0; i < input.steps.length; i++) {
-        const step = input.steps[i]!;
+        let step = input.steps[i]!;
+
+        // `@find:` 를 직전 스냅샷으로 채운다. 못 찾으면 여기서 멈춘다 —
+        // 요소를 못 찾은 것을 성공으로 넘기지 않는다 (R7.5).
+        if ('ref' in step && typeof step.ref === 'string' && isFindRef(step.ref)) {
+          const found = resolveRef(lastSnapshot, findPattern(step.ref));
+          if (!found) {
+            const detail = `요소를 찾지 못했다: ${findPattern(step.ref)}`;
+            steps.push({ index: i, op: step.op, ok: false, text: detail, reason: detail });
+            this.ledger.append({
+              actor: { kind: 'system', id: 'hands' },
+              kind: 'deny',
+              ...(input.runId ? { runId: input.runId } : {}),
+              summary: `${step.op} 중단 — ${detail}`,
+            });
+            return {
+              ok: false,
+              reason: 'step-failed',
+              detail,
+              steps,
+              screenshots: shots,
+              checklist: checklistFrom(input.steps, i),
+              surface,
+            };
+          }
+          step = { ...step, ref: found } as HandsStep;
+        }
+
         const result = await client.callTool(HANDS_TOOL[step.op], toolArguments(step));
-        steps.push({ index: i, op: step.op, ok: result.ok, text: result.text });
+        if (step.op === 'snapshot' && result.ok) lastSnapshot = result.text;
+
+        // 도구가 이미지를 돌려줬으면 우리 자리에 쓴다. playwright 의 임시
+        // 파일을 가리키는 것은 증거가 아니다 — 지워지면 사라진다 (R7.2).
+        const saved: string[] = [];
+        if (input.evidenceDir) {
+          result.images.forEach((image, n) => {
+            const ext = image.mimeType === 'image/jpeg' ? 'jpg' : 'png';
+            const file = join(input.evidenceDir as string, `${String(i).padStart(2, '0')}-${step.op}${n > 0 ? `-${n}` : ''}.${ext}`);
+            writeFileSync(file, Buffer.from(image.data, 'base64'));
+            saved.push(file);
+          });
+        }
+        shots.push(...saved);
+        steps.push({
+          index: i,
+          op: step.op,
+          ok: result.ok,
+          text: result.text,
+          ...(saved.length > 0 ? { screenshots: saved } : {}),
+        });
 
         this.ledger.append({
           actor: { kind: 'system', id: 'hands' },
@@ -215,7 +308,7 @@ export class HandsExecutor {
           ...(input.runId ? { runId: input.runId } : {}),
           payloadDigest: createHash('sha256').update(result.text).digest('hex'),
           summary: `${step.op} ${result.ok ? '성공' : '실패'}`,
-          evidence: [`step:${i}`],
+          evidence: saved.length > 0 ? saved : [`step:${i}`],
         });
 
         // 요소를 못 찾았거나 승인이 거부되면 여기서 멈춘다. 남은 단계를
@@ -227,12 +320,13 @@ export class HandsExecutor {
             reason: 'step-failed',
             detail: `단계 ${i} (${step.op}) 에서 중단`,
             steps,
+            screenshots: shots,
             checklist: checklistFrom(input.steps, i),
             surface,
           };
         }
       }
-      return { ok: true, steps, surface };
+      return { ok: true, steps, screenshots: shots, surface };
     } catch (err) {
       const detail = (err as Error).message;
       this.ledger.append({
