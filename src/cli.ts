@@ -371,7 +371,28 @@ function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalS
     file: join(resolveState(), 'broker', 'approvals.json'),
     notify: (devices, message) => note(`  알림 → [${devices.join(', ')}]: ${message}`),
   });
-  const engine = new RecipeEngine({ ledger, broker, approvals, policy, stateDir: resolveState() });
+  // 발행기를 함께 물린다. 레시피에 발행 스텝이 있는데 발행기가 없으면
+  // 그 자리에서 멈추므로(조용한 성공 금지), 항상 붙여 두는 편이 맞다.
+  const publisher = new PublishBroker({
+    ledger,
+    approvals,
+    policy,
+    store: new PublishStore({ file: join(resolveState(), 'publish', 'published.json') }),
+    adapters: [
+      new ThreadsAdapter(),
+      new NaverBlogAdapter({ hands: new HandsExecutor({ ledger }) }),
+    ],
+    evidenceRoot: join(resolveState(), 'evidence'),
+    notify: (m) => note(`  알림 → 오너: ${m}`),
+  });
+  const engine = new RecipeEngine({
+    ledger,
+    broker,
+    approvals,
+    policy,
+    stateDir: resolveState(),
+    publisher,
+  });
   return { engine, approvals };
 }
 

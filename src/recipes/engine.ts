@@ -29,6 +29,8 @@ import { classify } from '../policy/policy.js';
 import type { PolicyConfig } from '../policy/types.js';
 import { RunLock } from './lock.js';
 import type { Recipe, RunOutcome, RunState, Step, StepState } from './types.js';
+import type { PublishBroker } from '../publish/broker.js';
+import { isChannel } from '../verbs/types.js';
 
 export interface EngineOptions {
   ledger: Ledger;
@@ -39,12 +41,21 @@ export interface EngineOptions {
   stateDir: string;
   /** 게이트 명령 타임아웃. */
   gateTimeoutMs?: number;
+  /**
+   * 발행기. 없으면 `publish` 스텝이 실패한다.
+   *
+   * 선택으로 둔 이유는 레시피 대부분이 발행 없이 돌고, 그때 발행 어댑터
+   * 설정을 강요할 이유가 없기 때문이다. 다만 **없는 것을 통과로 처리하지는
+   * 않는다** — 발행 스텝이 있는데 발행기가 없으면 그 자리에서 멈춘다.
+   */
+  publisher?: PublishBroker;
 }
 
 export class RecipeEngine {
   private readonly ledger: Ledger;
   private readonly broker: SeatBroker;
   private readonly approvals: ApprovalService;
+  private readonly publisher: PublishBroker | undefined;
   private readonly policy: PolicyConfig;
   private readonly stateDir: string;
   private readonly gateTimeoutMs: number;
@@ -56,6 +67,7 @@ export class RecipeEngine {
     this.policy = opts.policy;
     this.stateDir = opts.stateDir;
     this.gateTimeoutMs = opts.gateTimeoutMs ?? 120_000;
+    this.publisher = opts.publisher;
     mkdirSync(join(this.stateDir, 'runs'), { recursive: true });
   }
 
@@ -322,12 +334,64 @@ export class RecipeEngine {
         return 'pause';
       }
 
-      case 'publish':
+      case 'publish': {
+        if (!this.publisher) {
+          // 발행기를 물리지 않은 엔진으로 발행 스텝을 돌리려 했다.
+          // 통과로 처리하지 않는다 — 조용한 성공을 만들지 않는다.
+          st.status = 'failed';
+          st.detail = '발행기가 연결되지 않은 엔진이다 (PublishBroker 미주입)';
+          return 'stop';
+        }
+
+        // 본문은 이전 스텝 산출물에서 온다. 레시피에 본문을 직접 적는
+        // 경로를 만들지 않는다 — 그러면 레시피가 자유 텍스트 발행 통로가 된다.
+        const body = state.artifacts[step.subject];
+        if (body === undefined) {
+          st.status = 'failed';
+          st.detail = `산출물 "${step.subject}" 이 없다 — 앞 스텝이 만들지 않았다`;
+          return 'stop';
+        }
+
+        if (!isChannel(step.channel)) {
+          st.status = 'failed';
+          st.detail = `알 수 없는 채널: ${step.channel}`;
+          return 'stop';
+        }
+
+        const result = await this.publisher.publish({
+          channel: step.channel,
+          verb: { op: 'post_text', channel: step.channel, body },
+          // 같은 레시피 실행의 같은 스텝은 한 번만 나간다 (R6.3). 재개해도
+          // 다시 나가지 않는 것이 R12.5 와 맞물리는 지점이다.
+          idempotencyKey: `${state.runId}:${step.id}`,
+          runId: state.runId,
+          ...(step.dryRun ? { dryRun: true } : {}),
+          ...(step.brandOk ? { brandPass: true } : {}),
+        });
+
+        if (!result.ok) {
+          st.status = 'failed';
+          st.detail = `발행 실패 — ${result.reason}${result.detail ? `: ${result.detail}` : ''}`;
+          // 체크리스트는 사람이 이어받는 자리다. 삼키지 않는다 (R6.6).
+          if (result.checklist?.length) st.detail += `\n  ${result.checklist.join('\n  ')}`;
+          return 'stop';
+        }
+
+        st.status = 'passed';
+        st.detail = result.reason === 'duplicate'
+          ? '이미 발행됨 — 다시 내보내지 않았다'
+          : result.payload !== undefined
+            ? '드라이런 — 실제로 나가지 않았다'
+            : `발행 완료${result.evidence?.url ? ` — ${result.evidence.url}` : ''}`;
+        if (result.evidence?.url) state.artifacts[`${step.id}.url`] = result.evidence.url;
+        return 'continue';
+      }
+
       case 'retro': {
-        // Task 9 / Task 13 에서 실물이 붙는다.
-        // 구현되지 않은 것을 통과로 처리하지 않는다 — 조용한 성공을 만들지 않는다.
+        // R11(검증과 복기)이 아직 없다. 구현되지 않은 것을 통과로 처리하지
+        // 않는다 — 레시피가 초록으로 끝나는데 복기가 없는 상태를 만들지 않는다.
         st.status = 'failed';
-        st.detail = `${step.kind} 스텝은 아직 구현되지 않았다 (Task ${step.kind === 'publish' ? 9 : 13})`;
+        st.detail = 'retro 스텝은 아직 구현되지 않았다 (R11 검증·복기 미구현)';
         return 'stop';
       }
     }

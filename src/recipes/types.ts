@@ -59,11 +59,27 @@ export interface ApprovalStep extends StepBase {
   subject: string;
 }
 
-/** 채널 발행. Task 9 에서 실물이 붙는다. */
+/**
+ * 채널 발행 (R6, R12.1).
+ *
+ * `subject` 는 **이전 스텝의 산출물 이름**이다. 본문을 레시피에 직접 적지
+ * 않는다 — 적을 수 있게 하면 레시피가 자유 텍스트 발행 경로가 되고, 동사
+ * 계약(R16.7)을 우회한다. 산출물을 만든 스텝이 본문의 출처다.
+ */
 export interface PublishStep extends StepBase {
   kind: 'publish';
   channel: string;
   subject: string;
+  /**
+   * 브랜드 대조를 통과한 것으로 볼지.
+   *
+   * 기본은 거짓이고, 그러면 발행 브로커가 막는다 (R5.5). 레시피에 적는다는
+   * 것은 오너가 브랜드 책임을 진다는 선언이다 — Studio 스텝이 붙기 전까지의
+   * 임시 통로이며, 기본값으로 열어 두지 않는다.
+   */
+  brandOk?: boolean;
+  /** 실제로 내보내지 않고 페이로드만 확인한다 (R6.4). */
+  dryRun?: boolean;
 }
 
 /** 발행 후 성과 회수와 복기. Task 13 에서 실물이 붙는다. */

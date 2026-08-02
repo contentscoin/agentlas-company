@@ -8,8 +8,8 @@
  *   3. 브랜드 게이트    위반이면 발행 단계로 넘기지 않는다      R5.5
  *   4. 멱등성 확인      이미 나갔으면 원래 증거를 돌려준다     R6.3
  *   5. 일일 상한 확인   넘으면 정지하고 오너에게 알린다        R6.5
- *   6. 어댑터 준비 확인 토큰·프로필이 없으면 여기서 멈춘다
- *   7. 드라이런이면 페이로드만 돌려주고 끝                     R6.4
+ *   6. 드라이런이면 페이로드만 돌려주고 끝                     R6.4
+ *   7. 어댑터 준비 확인 토큰·프로필이 없으면 여기서 멈춘다
  *   8. 게이트          승인 없이 나가지 않는다                R4
  *   9. 발행 + 증거 기록                                       R6.2
  *
@@ -199,20 +199,30 @@ export class PublishBroker {
       ]);
     }
 
-    // 6 — 어댑터가 실제로 나갈 수 있는가.
     const ready = adapter.ready();
-    if (!ready.ok) {
-      return this.fail(req, 'not-configured', ready.reason, ready.checklist);
-    }
 
-    // 7 — 드라이런은 여기서 끝. 아무것도 바꾸지 않으므로 승인이 필요 없다 (R6.4).
+    // 6 — 드라이런은 여기서 끝. 아무것도 바꾸지 않으므로 승인이 필요 없다 (R6.4).
+    //
+    // **준비 검사보다 앞이다.** 드라이런의 쓸모가 가장 큰 순간이 자격증명을
+    // 아직 넣지 않았을 때다 — "무엇이 나갈 것인가" 는 토큰 없이도 답할 수
+    // 있고, `describe()` 는 그렇게 만들어져 있다. 준비되지 않은 사실은
+    // 숨기지 않고 페이로드와 **함께** 보고한다. Task 15 실측에서 레시피
+    // 드라이런이 토큰 부재로 막히는 것을 보고 순서를 바꿨다.
     if (req.dryRun === true) {
       return {
         ok: true,
         channel: req.channel,
         idempotencyKey: req.idempotencyKey,
         payload: adapter.describe(req.verb),
+        ...(ready.ok
+          ? {}
+          : { detail: `드라이런 — 다만 지금은 발행할 수 없다: ${ready.reason}`, checklist: ready.checklist }),
       };
+    }
+
+    // 7 — 어댑터가 실제로 나갈 수 있는가.
+    if (!ready.ok) {
+      return this.fail(req, 'not-configured', ready.reason, ready.checklist);
     }
 
     // 8 — 게이트. 발행은 비가역이므로 최소 L3 이다.

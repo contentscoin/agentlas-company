@@ -14,6 +14,9 @@ import { RecipeError, loadRecipe, validateRecipe } from './load.js';
 import { RunLock } from './lock.js';
 import { emitForPlatform, launchdPlist, parseSchedule, schtasksCommand, systemdUnits } from './schedule.js';
 import type { Recipe } from './types.js';
+import { PublishBroker } from '../publish/broker.js';
+import { PublishStore } from '../publish/ledgerstore.js';
+import type { ChannelAdapter } from '../publish/types.js';
 
 let dir: string;
 let ledger: Ledger;
@@ -64,7 +67,52 @@ function build(opts: { runner?: typeof echoRunner } = {}): {
     file: join(dir, 'approvals.json'),
   });
   const engine = new RecipeEngine({ ledger, broker, approvals, policy: POLICY, stateDir: dir });
-  return { engine, approvals };
+  return { engine, approvals, ledger };
+}
+
+/** 발행기를 물린 엔진. 실제로 나가지 않는 가짜 어댑터를 쓴다. */
+function buildWithPublisher(over: Partial<ChannelAdapter> = {}): {
+  engine: RecipeEngine;
+  approvals: ApprovalService;
+  calls: () => number;
+} {
+  const ledger = Ledger.open(join(dir, 'events.jsonl'));
+  const broker = new SeatBroker({ ledger, seats: [fakeSeat('codex', 'openai')], runner: echoRunner });
+  const approvals = new ApprovalService({ policy: POLICY, ledger, file: join(dir, 'approvals.json') });
+
+  let n = 0;
+  const adapter: ChannelAdapter = {
+    channel: 'threads',
+    path: 'api',
+    ready: () => ({ ok: true }),
+    describe: (v) => ({ preview: v }),
+    publish: async () => {
+      n += 1;
+      return {
+        ok: true as const,
+        evidence: { url: `https://example.test/p/${n}`, screenshots: [], notes: [] },
+      };
+    },
+    ...over,
+  };
+
+  const publisher = new PublishBroker({
+    ledger,
+    approvals,
+    policy: POLICY,
+    store: new PublishStore({ file: join(dir, 'published.json') }),
+    adapters: [adapter],
+    evidenceRoot: join(dir, 'evidence'),
+  });
+  const engine = new RecipeEngine({
+    ledger,
+    broker,
+    approvals,
+    policy: POLICY,
+    stateDir: dir,
+    publisher,
+  });
+  return { engine, approvals, calls: () => n };
 }
 
 beforeEach(() => {
@@ -312,19 +360,59 @@ describe('승인 스텝은 블로킹이 아니다', () => {
   });
 });
 
-describe('구현되지 않은 스텝은 통과로 처리하지 않는다', () => {
-  it('publish 스텝에서 멈춘다', async () => {
+describe('발행 스텝 (R6, R12)', () => {
+  const RECIPE = (over: Record<string, unknown> = {}) => ({
+    name: 'pub',
+    steps: [
+      { id: 'draft', kind: 'seat' as const, persona: 'studio', instruction: '초안', produce: 'draft' },
+      { id: 'pub', kind: 'publish' as const, channel: 'threads', subject: 'draft', ...over },
+    ],
+  });
+
+  it('발행기가 없으면 통과가 아니라 실패다 — 조용한 성공을 만들지 않는다', async () => {
     const { engine } = build();
+    const outcome = await engine.start(RECIPE({ brandOk: true }));
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toContain('발행기가 연결되지 않은');
+  });
+
+  it('앞 스텝 산출물을 본문으로 발행한다', async () => {
+    const { engine, calls } = buildWithPublisher();
+    const outcome = await engine.start(RECIPE({ brandOk: true, dryRun: true }));
+    expect(outcome.status).toBe('completed');
+    // 드라이런이므로 어댑터는 불리지 않는다.
+    expect(calls()).toBe(0);
+  });
+
+  it('없는 산출물을 참조하면 실행 중에 멈춘다', async () => {
+    const { engine } = buildWithPublisher();
     const outcome = await engine.start({
       name: 'pub',
-      steps: [
-        { id: 'draft', kind: 'seat', persona: 'studio', instruction: '초안', produce: 'draft' },
-        { id: 'pub', kind: 'publish', channel: 'threads', subject: 'draft' },
-      ],
+      steps: [{ id: 'pub', kind: 'publish', channel: 'threads', subject: '없는것', brandOk: true }],
     });
     expect(outcome.status).toBe('failed');
-    expect(outcome.reason).toContain('구현되지 않았다');
+    expect(outcome.reason).toContain('없는것');
   });
+
+  it('브랜드 대조를 선언하지 않으면 발행이 막힌다 (R5.5)', async () => {
+    const { engine, calls } = buildWithPublisher();
+    const outcome = await engine.start(RECIPE());
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toContain('brand-fail');
+    expect(calls()).toBe(0);
+  });
+
+  it('발행 실패의 체크리스트를 삼키지 않는다 (R6.6)', async () => {
+    const { engine } = buildWithPublisher({
+      ready: () => ({ ok: false, reason: '토큰 없음', checklist: ['토큰을 설정하세요'] }),
+    });
+    const outcome = await engine.start(RECIPE({ brandOk: true }));
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toContain('토큰을 설정하세요');
+  });
+});
+
+describe('구현되지 않은 스텝은 통과로 처리하지 않는다', () => {
 
   it('retro 스텝에서 멈춘다', async () => {
     const { engine } = build();

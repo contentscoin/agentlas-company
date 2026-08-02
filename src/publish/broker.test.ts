@@ -242,6 +242,18 @@ describe('오염 (R16.5)', () => {
 });
 
 describe('실패와 체크리스트 (R6.6)', () => {
+  it('드라이런은 자격증명 없이도 페이로드를 준다 — 다만 못 나간다는 사실을 함께 알린다', async () => {
+    const r = await broker([
+      fakeAdapter({
+        ready: () => ({ ok: false, reason: '토큰 없음', checklist: ['토큰을 설정하세요'] }),
+      }),
+    ]).publish(req({ dryRun: true }));
+    expect(r.ok).toBe(true);
+    expect(r.payload).toBeDefined();
+    expect(r.detail).toContain('토큰 없음');
+    expect(r.checklist).toEqual(['토큰을 설정하세요']);
+  });
+
   it('어댑터가 준비되지 않으면 설정 문제로 구분한다', async () => {
     const r = await broker([
       fakeAdapter({

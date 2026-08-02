@@ -8,6 +8,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import type { Recipe, Step } from './types.js';
+import { isChannel } from '../verbs/types.js';
 
 export class RecipeError extends Error {
   readonly problems: string[];
@@ -74,6 +75,16 @@ export function validateRecipe(value: unknown): string[] {
     if (kind === 'publish') {
       for (const key of ['channel', 'subject']) {
         if (typeof s[key] !== 'string' || s[key] === '') problems.push(`${at}.${key} 가 필요하다`);
+      }
+      // 채널명을 실행 전에 막는다. 실행 중에 알면 앞 스텝의 좌석 호출이
+      // 이미 소모된 뒤다 — 좌석 호출은 공짜가 아니다.
+      if (typeof s['channel'] === 'string' && s['channel'] !== '' && !isChannel(s['channel'])) {
+        problems.push(`${at}.channel 이 알 수 없는 채널이다: ${s['channel']}`);
+      }
+      for (const key of ['brandOk', 'dryRun']) {
+        if (s[key] !== undefined && typeof s[key] !== 'boolean') {
+          problems.push(`${at}.${key} 는 불리언이어야 한다`);
+        }
       }
     }
 
