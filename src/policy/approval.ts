@@ -141,6 +141,29 @@ export class ApprovalService {
   }
 
   /**
+   * 같은 작업·같은 digest 의 아직 열려 있는 요청을 찾는다.
+   *
+   * 게이트(gate.ts)가 매 시도마다 새 카드를 만들면 오너 화면이 같은 요청의
+   * 사본으로 덮이고, 그중 하나만 승인해도 나머지가 남아 무엇이 인가된 것인지
+   * 흐려진다. 열린 카드가 있으면 그것을 재사용한다.
+   *
+   * 종단 상태(거부·만료·중단·소비·무효)는 열린 것이 아니므로 여기 걸리지 않는다.
+   * 따라서 거부된 요청을 재시도하면 **새 카드가 만들어진다** — 거부가 영구
+   * 차단이 아니라는 뜻이다. 영구 차단으로 두지 않은 이유는 해제 경로가 없어서
+   * 오너가 같은 패키지를 영원히 설치할 수 없게 되기 때문이다. 재시도의 대가는
+   * 매번 오너 승인을 다시 받아야 하는 것이고, 모든 시도가 원장에 남는다.
+   */
+  findOpen(action: string, payloadDigest: string): ApprovalRequest | undefined {
+    this.sweep();
+    return [...this.requests.values()].find(
+      (r) =>
+        r.action === action &&
+        r.payloadDigest === payloadDigest &&
+        (r.status === 'pending' || r.status === 'approved'),
+    );
+  }
+
+  /**
    * 승인한다.
    *
    * 검사 순서: 존재 → 상태 → 신원 허용목록 → 단계별 인증 → digest 일치.

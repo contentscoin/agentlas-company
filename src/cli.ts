@@ -23,6 +23,7 @@ import { CapabilityStore } from './capabilities/store.js';
 import { RISKY_CAPABILITIES, isRiskyCapability, type Caller } from './capabilities/types.js';
 import { humanRemaining, parseTtl } from './capabilities/ttl.js';
 import { classify, loadPolicy } from './policy/policy.js';
+import { resolveGate } from './policy/gate.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
 import { randomUUID } from 'node:crypto';
@@ -41,6 +42,18 @@ function out(text: string): void {
 
 function jsonOut(value: unknown): void {
   process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+}
+
+/**
+ * 사람에게 보여줄 곁가지 알림.
+ *
+ * stdout 이 아니라 stderr 로 나간다. stdout 은 `--json` 계약이 차지하고 있고,
+ * 알림 한 줄이 섞이면 호출자의 `JSON.parse` 가 깨진다. 실제로 `company gate`
+ * 를 만들면서 이 문제를 밟았다 — 승인 카드 생성 알림이 JSON 앞에 붙었다.
+ * 터미널 사용자에게는 여전히 보인다.
+ */
+function note(text: string): void {
+  process.stderr.write(text + '\n');
 }
 
 function hasFlag(argv: string[], name: string): boolean {
@@ -204,7 +217,7 @@ function capStore(argv: string[]): CapabilityStore {
   return new CapabilityStore({
     file,
     ledger,
-    notify: (message) => out(`  알림 → 등록 기기 전체: ${message}`),
+    notify: (message) => note(`  알림 → 등록 기기 전체: ${message}`),
   });
 }
 
@@ -324,7 +337,7 @@ function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalS
     policy,
     ledger,
     file: join(resolveState(), 'broker', 'approvals.json'),
-    notify: (devices, message) => out(`  알림 → [${devices.join(', ')}]: ${message}`),
+    notify: (devices, message) => note(`  알림 → [${devices.join(', ')}]: ${message}`),
   });
   const engine = new RecipeEngine({ ledger, broker, approvals, policy, stateDir: resolveState() });
   return { engine, approvals };
@@ -513,7 +526,7 @@ function approvalService(argv: string[]): { svc: ApprovalService; source: 'file'
     policy,
     ledger,
     file: join(resolveState(), 'broker', 'approvals.json'),
-    notify: (devices, message) => out(`  알림 → [${devices.join(', ')}]: ${message}`),
+    notify: (devices, message) => note(`  알림 → [${devices.join(', ')}]: ${message}`),
   });
   return { svc, source };
 }
@@ -554,6 +567,63 @@ function cmdClassify(argv: string[]): number {
   out(`단계별 인증 ${c.needsStepUp ? 'yes' : 'no'}`);
   out(`비가역      ${c.irreversible ? 'yes (유예 창 적용)' : 'no'}`);
   return EXIT_OK;
+}
+
+/**
+ * 실행 게이트 — 외부 실행 표면이 위험 작업 직전에 묻는 자리 (R4, R13.3).
+ *
+ * `agentlas-desktop` 이 Hub 에이전트를 차용하기 전에 이걸 호출한다. 종료 코드가
+ * 계약이다: 0 인가, 1 거부, 2 돌릴 수 없었다. 호출자는 `--json` 의 `allowed` 를
+ * 읽거나 종료 코드만 봐도 된다.
+ *
+ * 2 를 1 과 구분하는 이유는 실행 표면이 이 둘을 다르게 다뤄야 하기 때문이다.
+ * 1 은 "물어봤고 안 된다는 답을 받았다" 이고, 2 는 "묻지 못했다" 이다.
+ * 후자를 통과로 해석하면 게이트를 끄는 방법이 게이트를 고장내는 것이 된다.
+ */
+function cmdGate(argv: string[]): number {
+  const action = flagValue(argv, '--action');
+  const digest = flagValue(argv, '--digest');
+  if (!action || !digest) {
+    process.stderr.write(
+      '사용법: company gate --action <작업> --digest <sha256> [--summary "..."] [--tainted] [--critic BLOCK] [--sei-risk] [--run <runId>]\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  const { policy } = loadPolicy(policyFile(argv));
+  const ledger = Ledger.open(ledgerPath(argv));
+  const { svc } = approvalService(argv);
+  const critic = flagValue(argv, '--critic');
+  const runId = flagValue(argv, '--run');
+
+  const decision = resolveGate(
+    { policy, approvals: svc, ledger },
+    {
+      action,
+      payloadDigest: digest,
+      summary: flagValue(argv, '--summary') ?? action,
+      ...(critic ? { criticVerdict: critic.toUpperCase() as 'CLEAR' | 'WATCH' | 'BLOCK' } : {}),
+      ...(hasFlag(argv, '--sei-risk') ? { seiRisk: true } : {}),
+      ...(hasFlag(argv, '--tainted') ? { tainted: true } : {}),
+      ...(runId ? { runId } : {}),
+    },
+  );
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut(decision);
+    return decision.allowed ? EXIT_OK : EXIT_FINDING;
+  }
+
+  out(`작업    ${decision.action}`);
+  out(`등급    ${decision.level}${decision.irreversible ? ' [비가역]' : ''}`);
+  out(`판정    ${decision.allowed ? '인가' : '거부'} — ${decision.reason}${decision.detail ? ` (${decision.detail})` : ''}`);
+  if (decision.approvalId) {
+    out(`승인    ${decision.approvalId}`);
+    if (decision.reason === 'approval-pending') {
+      out(`        company approvals approve ${decision.approvalId} --digest ${digest}${decision.needsStepUp ? ' --step-up' : ''}`);
+    }
+  }
+  return decision.allowed ? EXIT_OK : EXIT_FINDING;
 }
 
 /** 승인 대기 목록과 결정 (R4). */
@@ -651,6 +721,10 @@ function usage(): void {
   out('  company approvals reject <id> [--reason 사유]');
   out('  company approvals abort <id>        유예 창 안에서 중단');
   out('');
+  out('  실행 게이트 (R4, R13.3) — 외부 실행 표면이 위험 작업 직전에 묻는 자리');
+  out('  company gate --action <작업> --digest <sha256> [--summary "..."] [--tainted]');
+  out('      종료 0=인가  1=거부  2=묻지 못함. 2 를 통과로 해석하면 안 됩니다');
+  out('');
   out('  회의 (R3) — 2라운드 턴제, Critic 은 다른 벤더 좌석');
   out('  company meeting --agenda "안건" [--attendees cto,growth] [--companyctl <경로>]');
   out('');
@@ -679,6 +753,8 @@ async function main(): Promise<number> {
         return cmdCaps(argv);
       case 'classify':
         return cmdClassify(argv);
+      case 'gate':
+        return cmdGate(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':
