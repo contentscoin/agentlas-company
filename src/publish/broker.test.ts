@@ -52,8 +52,15 @@ function broker(adapters: ChannelAdapter[], dailyLimits?: Record<string, number>
   });
 }
 
+/**
+ * 기본 요청.
+ *
+ * `brandPass: true` 를 명시한다 — 브로커가 브랜드 대조를 거치지 않은 발행을
+ * 막기 때문이다 (R5.5). 이 기본값 자체가 게이트의 존재 증명이라, 아래에
+ * 생략했을 때 막히는지도 따로 시험한다.
+ */
 function req(over: Partial<PublishRequest> = {}): PublishRequest {
-  return { channel: 'threads', verb: VERB, idempotencyKey: 'k1', ...over };
+  return { channel: 'threads', verb: VERB, idempotencyKey: 'k1', brandPass: true, ...over };
 }
 
 /** 게이트를 통과시킨다. 발행은 L3 이라 승인 없이는 나가지 않는다. */
@@ -193,6 +200,33 @@ describe('일일 상한 (R6.5)', () => {
     // UTC 로 세면 한국 시간 오전 9시에 상한이 초기화된다.
     const at = new Date(2026, 7, 2, 1, 30);
     expect(localDayKey(at)).toBe('2026-08-02');
+  });
+});
+
+describe('브랜드 게이트 (R5.5)', () => {
+  it('브랜드 대조를 하지 않은 발행은 막는다 — 건너뛴 것은 통과가 아니다', async () => {
+    const adapter = fakeAdapter();
+    const r = await broker([adapter]).publish({
+      channel: 'threads',
+      verb: VERB,
+      idempotencyKey: 'nb',
+    });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('brand-fail');
+    expect((adapter as unknown as { calls: number }).calls).toBe(0);
+  });
+
+  it('브랜드 위반은 내역을 체크리스트에 싣는다', async () => {
+    const r = await broker([fakeAdapter()]).publish(
+      req({ brandPass: false, brandNotes: ['금지 표현 "최저가" (위치 12)'] }),
+    );
+    expect(r.reason).toBe('brand-fail');
+    expect(r.checklist?.join()).toContain('최저가');
+  });
+
+  it('브랜드 실패는 오염보다 뒤다 — 오염이 더 강한 거부다', async () => {
+    const r = await broker([fakeAdapter()]).publish(req({ tainted: true, brandPass: false }));
+    expect(r.reason).toBe('tainted');
   });
 });
 

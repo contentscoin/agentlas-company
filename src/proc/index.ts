@@ -233,10 +233,25 @@ function spawnChild(
           }, opts.timeoutMs)
         : undefined;
 
-    if (opts.input !== undefined) {
-      child.stdin?.write(opts.input);
+    // 자식이 이미 죽었거나 stdin 을 읽지 않으면 write 가 EPIPE 를 던진다.
+    // 그 에러는 스트림의 'error' 이벤트로 나오고, 핸들러가 없으면 **부모
+    // 프로세스가 통째로 죽는다**. Task 11 실측에서 밟았다 — 좌석 CLI 가
+    // 설치되어 있지 않아 자식이 즉시 종료했고, company 가 스택 트레이스를
+    // 뱉으며 죽었다. 좌석이 없는 것은 흔한 상태이고, 그때 죽으면 안 된다.
+    //
+    // 파이프가 닫힌 것은 실패가 아니라 정보다 — 종료 코드로 판정한다.
+    const stdin = child.stdin;
+    if (stdin) {
+      stdin.on('error', () => {
+        // 닫힌 파이프. 판정은 종료 코드가 한다.
+      });
+      try {
+        if (opts.input !== undefined) stdin.write(opts.input);
+        stdin.end();
+      } catch {
+        // 위와 같다. 동기 예외로 나오는 경로도 있다.
+      }
     }
-    child.stdin?.end();
 
     const finish = (code: number | null): void => {
       if (timer) clearTimeout(timer);

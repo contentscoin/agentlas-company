@@ -40,6 +40,9 @@ import { parseVerb } from './verbs/parse.js';
 import { zoneLayout } from './zones/layout.js';
 import { currentAccount, verifyZones } from './zones/verify.js';
 import { describeFinding, lint } from './zones/lint.js';
+import { Studio } from './studio/studio.js';
+import { describeSlots, publishReadiness, SLOT_KINDS, type SlotKind } from './studio/artifact.js';
+import type { BrandPack } from './studio/brandpack.js';
 import { DEFAULT_VERB_POLICY } from './verbs/types.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
@@ -936,6 +939,9 @@ async function cmdPublish(argv: string[]): Promise<number> {
     idempotencyKey: flagValue(argv, '--key') ?? `${parsed.verb.channel}:${runId}`,
     ...(hasFlag(argv, '--dry-run') ? { dryRun: true } : {}),
     ...(hasFlag(argv, '--tainted') ? { tainted: true } : {}),
+    // 브랜드 대조는 Studio 가 한다. CLI 로 직접 발행할 때는 오너가 책임을
+    // 진다고 명시해야 통과한다 (R5.5) — 기본값으로 열어 두지 않는다.
+    ...(hasFlag(argv, '--brand-ok') ? { brandPass: true } : {}),
     runId,
   });
 
@@ -1065,6 +1071,80 @@ function cmdSecurity(argv: string[]): number {
   return report.ok ? EXIT_OK : EXIT_FINDING;
 }
 
+/**
+ * Studio — 산출물 생성과 브랜드 대조 (R5).
+ *
+ * 이미지·영상은 desktop 표면이 없어 **막힌 슬롯**으로 남는다. 그 사실을
+ * 표에 그대로 보여준다 — 조용히 비워 두면 발행 직전에야 알게 된다.
+ */
+async function cmdStudio(argv: string[]): Promise<number> {
+  const brief = flagValue(argv, '--brief');
+  const title = flagValue(argv, '--title') ?? '제목 없음';
+  if (!brief) {
+    process.stderr.write(
+      '사용법: company studio --brief "<기획 의도>" [--title <제목>] [--want copy,plan]\n' +
+        '        --pack <브랜드팩.json> 으로 브랜드 규칙을 지정합니다.\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  const packFile = flagValue(argv, '--pack');
+  let pack: BrandPack = {
+    masterSheet: { forbidden: [], required: [] },
+    characters: [],
+    contentBase: { claims: [] },
+  };
+  if (packFile) {
+    try {
+      pack = JSON.parse(readFileSync(packFile, 'utf8')) as BrandPack;
+    } catch (err) {
+      process.stderr.write(`브랜드 팩을 읽지 못했습니다: ${(err as Error).message}\n`);
+      return EXIT_CANNOT_RUN;
+    }
+  } else {
+    note('  알림: 브랜드 팩이 지정되지 않아 규칙 없이 대조합니다 (--pack)');
+  }
+
+  const wantRaw = (flagValue(argv, '--want') ?? 'copy,plan').split(',').map((w) => w.trim());
+  const want = wantRaw.filter((w): w is SlotKind => (SLOT_KINDS as readonly string[]).includes(w));
+  const unknown = wantRaw.filter((w) => w && !(SLOT_KINDS as readonly string[]).includes(w));
+  if (unknown.length > 0) {
+    process.stderr.write(`알 수 없는 슬롯: ${unknown.join(', ')} (허용: ${SLOT_KINDS.join(', ')})\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const ledger = Ledger.open(ledgerPath(argv));
+  const studio = new Studio({ broker: new SeatBroker({ ledger }), ledger, pack });
+  const artifact = await studio.produce({
+    title,
+    brief,
+    want,
+    ...(hasFlag(argv, '--tainted') ? { tainted: true } : {}),
+  });
+
+  const readiness = publishReadiness(artifact, want);
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut({ artifact, readiness });
+    return readiness.ready ? EXIT_OK : EXIT_FINDING;
+  }
+
+  out(`산출물  ${artifact.title}  (${artifact.id})`);
+  out('');
+  for (const row of describeSlots(artifact)) out(`  ${row}`);
+  out('');
+  out(`브랜드  ${artifact.brandPass ? 'PASS' : 'FAIL'}`);
+  for (const note_ of artifact.brandNotes) out(`  ${note_}`);
+  out('');
+  if (readiness.ready) {
+    out('발행 가능');
+  } else {
+    out('발행 불가:');
+    for (const reason of readiness.reasons) out(`  ${reason}`);
+  }
+  return readiness.ready ? EXIT_OK : EXIT_FINDING;
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
   const sub = subcommand(argv);
@@ -1174,8 +1254,11 @@ function usage(): void {
   out('  company office device list | revoke <ID>');
   out('  company office enroll <기기ID>                  단계별 인증(TOTP) 등록');
   out('');
+  out('  Studio (R5) — 좌석 산출 + 브랜드 대조. 이미지·영상은 표면 부재로 막힘');
+  out('  company studio --brief "<기획 의도>" [--want copy,plan] [--pack <팩.json>]');
+  out('');
   out('  발행 (R6) — OAuth API 든 브라우저 조작이든 같은 계약');
-  out('  company publish --verb <동사.json> [--key <멱등키>] [--dry-run]');
+  out('  company publish --verb <동사.json> [--key <멱등키>] [--dry-run] [--brand-ok]');
   out('      동사는 파일로만 받습니다. 자유 텍스트를 받는 인자는 없습니다');
   out('');
   out('  구역·비밀 (R15) — 좌석은 브로커 자산을 보지 못한다');
@@ -1220,6 +1303,8 @@ async function main(): Promise<number> {
         return await cmdPublish(argv);
       case 'security':
         return cmdSecurity(argv);
+      case 'studio':
+        return await cmdStudio(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':

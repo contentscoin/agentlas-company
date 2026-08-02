@@ -29,6 +29,17 @@ export interface PublishRequest {
   runId?: string;
   /** 신뢰등급 0 콘텐츠를 만졌는가 (R16.3). */
   tainted?: boolean;
+  /**
+   * 이 본문을 낸 산출물의 브랜드 대조 결과 (R5.5).
+   *
+   * `false` 면 발행하지 않는다. **`undefined` 도 발행하지 않는다** — 검사를
+   * 건너뛴 것을 통과로 읽으면 검사가 없는 것과 같다. Studio 를 거치지 않은
+   * 발행은 `brandPass: true` 를 명시해야 하며, 그것은 호출자가 브랜드 책임을
+   * 진다는 선언이다.
+   */
+  brandPass?: boolean;
+  /** 브랜드 위반 내역. 체크리스트에 그대로 실린다. */
+  brandNotes?: string[];
 }
 
 /** 발행이 남긴 증거 (R6.2). URL 이거나 스크린샷이거나, 둘 다일 수 있다. */
@@ -50,6 +61,8 @@ export type PublishFailure =
   | 'adapter-failed'
   /** 본문에서 비밀·PII 가 검출됐다 (R15.5). */
   | 'secret-detected'
+  /** 브랜드 팩 대조에 실패했다 (R5.5). */
+  | 'brand-fail'
   | 'not-configured';
 
 export interface PublishResult {
