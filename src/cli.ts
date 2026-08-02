@@ -47,6 +47,9 @@ import { HireBroker, hireDigest } from './hire/hire.js';
 import { readBorrowed } from './hire/lock.js';
 import { parseCloseBlock, type HireRequest } from './org/protocol.js';
 import { ALL_PERSONAS } from './org/personas.js';
+import { checkHealth } from './ops/health.js';
+import { detectAnomalies, describeAnomaly, unreadableLedger } from './ops/anomaly.js';
+import { buildDigest, renderDigest } from './ops/digest.js';
 import { DEFAULT_VERB_POLICY } from './verbs/types.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
@@ -1285,6 +1288,95 @@ async function cmdHire(argv: string[]): Promise<number> {
   return worst;
 }
 
+/**
+ * 무인 운영 (R17).
+ *
+ * 하위 명령: `health`(부팅 복귀 점검), `watch`(이상 탐지), `digest`(일일 요약)
+ */
+function cmdOps(argv: string[]): number {
+  const sub = subcommand(argv) ?? 'health';
+  const ledger = Ledger.open(ledgerPath(argv));
+
+  if (sub === 'health') {
+    const store = capStore(argv);
+    const report = checkHealth({
+      ledger,
+      capabilities: store.list({ zone: 'owner', id: 'ops' }),
+    });
+    if (hasFlag(argv, '--json')) {
+      jsonOut(report);
+      return report.ok ? EXIT_OK : EXIT_FINDING;
+    }
+    out(`부팅 복귀 점검 — ${report.at}`);
+    out('');
+    for (const c of report.checks) {
+      const mark = c.verdict === 'ok' ? '정상' : c.verdict === 'degraded' ? '부분' : '손상';
+      out(`  ${mark}  ${c.name.padEnd(12)} ${c.detail}`);
+    }
+    if (report.actions.length > 0) {
+      out('');
+      out('사람이 할 일:');
+      for (const a of report.actions) out(`  ${a}`);
+    }
+    return report.ok ? EXIT_OK : EXIT_FINDING;
+  }
+
+  if (sub === 'watch') {
+    // 원장을 읽지 못하면 "이상 없음" 이 아니라 정지 대상이다.
+    let report;
+    try {
+      report = detectAnomalies(ledger.query({ limit: 2000 }), Date.now());
+    } catch (err) {
+      report = unreadableLedger((err as Error).message);
+    }
+
+    if (report.shouldHalt && hasFlag(argv, '--halt')) {
+      // 새 정지 장치를 만들지 않고 전체 차단을 재사용한다 (R8.10).
+      const states = capStore(argv).panicDisableAll(
+        { zone: 'owner', id: 'ops-watch' },
+        `이상 탐지 — ${report.anomalies.map((a) => a.kind).join(', ')}`,
+      );
+      note(`  능력 ${states.length}종 전부 차단했습니다`);
+    }
+
+    if (hasFlag(argv, '--json')) {
+      jsonOut(report);
+      return report.shouldHalt ? EXIT_FINDING : EXIT_OK;
+    }
+    if (report.anomalies.length === 0) {
+      out(
+        `이상 없음 — 최근 창 거부 ${report.counts.recentDeny}건, ` +
+          `실행 ${report.counts.recentVolume}건`,
+      );
+      return EXIT_OK;
+    }
+    for (const a of report.anomalies) out(describeAnomaly(a));
+    if (report.shouldHalt && !hasFlag(argv, '--halt')) {
+      out('');
+      out('정지하려면: company ops watch --halt');
+    }
+    return EXIT_FINDING;
+  }
+
+  if (sub === 'digest') {
+    // 좌석 만료 시각은 아직 실측되지 않았다. 모르는 것을 추정하지 않는다.
+    const expiries = ALL_SEATS.filter((sp) => sp.verified).map((sp) => ({
+      seat: sp.id,
+      remainingMs: null,
+    }));
+    const digest = buildDigest(ledger.query({ limit: 5000 }), new Date(), expiries);
+    if (hasFlag(argv, '--json')) {
+      jsonOut(digest);
+      return EXIT_OK;
+    }
+    for (const line of renderDigest(digest)) out(line);
+    return EXIT_OK;
+  }
+
+  process.stderr.write(`알 수 없는 하위 명령: ${sub}\n`);
+  return EXIT_CANNOT_RUN;
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
   const sub = subcommand(argv);
@@ -1401,6 +1493,12 @@ function usage(): void {
   out('  company publish --verb <동사.json> [--key <멱등키>] [--dry-run] [--brand-ok]');
   out('      동사는 파일로만 받습니다. 자유 텍스트를 받는 인자는 없습니다');
   out('');
+  out('  무인 운영 (R17) — 재부팅 복귀·이상 탐지·일일 요약');
+  out('  company ops health               부팅 후 원장·스위치·표면 점검');
+  out('  company ops watch [--halt]       거부·볼륨 급증 탐지 (--halt 는 전체 차단)');
+  out('  company ops digest               오늘의 위험 능력·스위치·거부');
+  out('  침해 대응은 docs/RUNBOOK-침해.md');
+  out('');
   out('  채용 (R13) — 회의가 결정하고 오너가 L3 로 승인한다');
   out('  company hire --from-meeting <마감블록.txt> | --borrow <패키지> --reason "<사유>"');
   out('  company hire list                차용된 에이전트와 권한');
@@ -1451,6 +1549,8 @@ async function main(): Promise<number> {
         return await cmdStudio(argv);
       case 'hire':
         return await cmdHire(argv);
+      case 'ops':
+        return cmdOps(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':
