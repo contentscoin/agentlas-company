@@ -3,6 +3,33 @@
 각 태스크는 독립적으로 시연 가능해야 하고, 완료 시 요구사항 번호로 추적됩니다.
 태스크 1이 완료되기 전에는 런타임 코드를 추가하지 않습니다.
 
+## 2026-08-02 재정의 — company 는 통제, desktop 은 실행
+
+`agentlas-desktop`(v0.9.29, TS/TSX 627개)이 Hands·모바일·Studio·Hub 를 이미 갖고 있다는
+사실을 확인했습니다. Task 9~17 은 그걸 모르는 채로 세워졌고, 그대로 두면 전부 다시
+만들게 됩니다. **company 의 고유 가치는 통제 계층** — 해시체인 원장, 정책 등급·승인 게이트,
+능력 스위치, 오염 추적, 크로스벤더 회의 프로토콜 — 이고 desktop 에 이게 없습니다.
+실행 표면은 desktop 것을 씁니다. 설계 §agentlas-desktop 경계 참조.
+
+| 태스크 | 처리 | 근거 |
+|---|---|---|
+| 9 발행 | **자체 구현 유지** | desktop 에 채널 발행 구현 없음 |
+| 10 Hands | **desktop 연동** | `computer-use` 제어 서버 계약 존재 |
+| 11 Studio | **범위 축소** | desktop Studio 는 `ipcMain` 뒤 — 헤드리스 미도달 |
+| 14 오피스·모바일 | **desktop 연동** | `mobile-bridge` 12개 모듈, main.ts 기동 확인 |
+| 16 채용 | **desktop 연동 + 선행조건** | Hub 는 있으나 게이트 훅이 desktop 변경을 요구 |
+| 17 무인운영 | **자체 구현 유지** | desktop automation 은 대상이 다름 |
+
+연동 범위를 정한 것은 헤드리스 도달성입니다. desktop 기능 대부분이 `electron/ipc.ts` 의
+`ipcMain.handle` **486개** 뒤에 있어 Electron 렌더러에서만 호출됩니다. 밖으로 나온 표면은
+`computer-use/control-server` · `mobile-bridge/server` · `browser/approval-server` ·
+`mcp-tools/registry` 넷뿐이고, 이 넷이 연동 가능 범위의 전부입니다.
+
+**주의 — 순서가 바뀌었습니다.** 이전 권고는 "Task 9 먼저"였습니다. 재정의 후 Task 9 는
+Task 10(네이버 블로그 Hands 경로)에 의존하고, L3 비가역 작업인 실제 발행은 8.1 단계별
+인증이 자리표시자인 채로 켜면 안 됩니다. 8.1 은 Task 14 에서 해소됩니다.
+따라서 **10 → 14 → 9** 가 새 임계 경로입니다.
+
 - [x] 1. 좌석 계약 실측 — `SEAT-CONTRACT.md`
   - [x] 4개 CLI의 설치 여부·버전·비대화형 명령·출력 형식·종료 코드 측정
   - [x] 모든 `*_API_KEY`를 제거한 환경에서 호출 (제거 전에도 전부 unset이었음 → OAuth 경로 확정)
@@ -107,22 +134,47 @@
   - _Requirements: R8, R15.8, R16.5, R17.3_
 
 - [ ] 9. 허용 동사와 첫 발행 루프
+  - **재정의 없음 — 자체 구현으로 남는다(2026-08-02 확인).** desktop 에 채널 발행 구현이
+    없다. `creative-pack/`·`ecommerce-pack/` 은 각각 `surface.ts` 하나이고
+    `threads`·`instagram` 은 `experience/taxonomy.ts`·`mcp-tools/catalog.ts` 의 문자열이다
   - `PublishRequest` 계약, `idempotencyKey` 멱등성, 드라이런, 채널 일일 상한
   - 쓰레드(OAuth API)와 네이버 블로그(Hands)를 각각 하나씩 살려 경로 추상화 검증
+  - 네이버 블로그 경로는 Task 10 의 `DesktopHandsAdapter` 를 쓴다 → **Task 10 이 선행**
   - 시연: 기획 → 초안 → 승인 → 실제 발행 완주, 원장에 URL 증거. **첫 성과 발생 지점**
   - _Requirements: R6_
+  - _의존: Task 10 (Hands 경로), Task 14 또는 8.1 (L3 실물 인증 — 아래 주의 참조)_
 
-- [ ] 10. Hands 일반화
-  - 전용 브라우저 프로필 + CDP, 단계별 스크린샷, 스키마·도메인 검증
-  - 요소 미발견 시 중단(조용한 성공 금지), 반자동 체크리스트 폴백
-  - 스마트스토어·네이버 클립·카카오채널 어댑터, 집계값만 반환
-  - 시연: 클립 초안 업로드를 자동 수행, 실패 시 이어받을 체크리스트 생성
+- [ ] 10. Hands — desktop computer-use 연동
+  - **재정의(2026-08-02)**: CDP 브라우저 조작과 네이티브 입력을 자체 구현하지 않는다.
+    `agentlas-desktop` 이 이미 가진 표면에 붙는다. 설계 §agentlas-desktop 경계 참조
+  - `DesktopHandsAdapter` — 제어 파일 `<userData>/computer-use/control.json` 을 읽고
+    (`{ schemaVersion, port, token }`, mode 0600) loopback HTTP 에 `Bearer <token>` 으로 호출
+  - `schemaVersion !== 1` 이면 실행하지 않고 실패한다. 미지원 버전을 추정으로 진행하지 않는다
+  - 도구 16종(`computer_status`·`focus_app`·`click`·`type_text`·`press_key` 등)을 타입 지정
+    동사로 감싼다. 자유 텍스트가 desktop 으로 넘어가는 경로를 만들지 않는다 (Z2→Z1 규칙)
+  - desktop 미기동·제어 파일 부재·토큰 불일치는 각각 다른 실패로 구분한다. 조용한 성공 금지
+  - 모든 호출과 거부를 원장에 기록. 오염된 입력은 스위치가 켜져 있어도 거부 (R16.5)
+  - 스마트스토어 집계값 전용 규칙은 company 쪽 동사 계약에서 강제한다 (R7.6 — desktop 은 모른다)
+  - 반자동 체크리스트 폴백은 유지 — desktop 이 요소를 못 찾으면 사람이 이어받는다 (R7.5)
+  - 시연: `company hands` 가 desktop 을 통해 실제 조작 1건 수행, 원장에 증거
+  - [ ] 10.1 desktop 미설치 환경의 동작 확정 — 현재 미정. Hands 스텝을 실패로 막을지,
+        체크리스트 폴백으로 강등할지는 Task 9 실사용 후 결정
   - _Requirements: R7_
+  - _업스트림: agentlas-desktop `electron/computer-use/{control-server,channel,mcp-server}.ts`_
 
-- [ ] 11. Studio
-  - 글은 좌석, 이미지·영상은 OAuth 생성 경로, 프로그램은 Cursor 좌석
-  - 브랜드 팩 대조, 위반 시 게이트 FAIL, 생성 코드 격리 실행
-  - 시연: 한 포스트에 카피·이미지·짧은 클립이 한 번에 산출
+- [ ] 11. Studio — 좌석 산출 + desktop 표면 (범위 축소)
+  - **재정의(2026-08-02)**: desktop 의 Studio 계열(`creative-pack/`·`document/`·`oberon/`·
+    `agents/oberon-film-studio`)은 전부 `ipcMain` 뒤에 있어 헤드리스로 닿지 않는다.
+    따라서 이 태스크는 **닿는 것만** 한다
+  - 글·기획·프로그램은 company 좌석으로 자체 산출 (기존 계획 유지 — 좌석은 이미 있다)
+  - 브랜드 팩 대조와 위반 시 게이트 FAIL 은 company 가 소유한다. desktop 의
+    `shared/brand-safety.ts` 는 참조만 하고 import 하지 않는다 (별도 배포 단위)
+  - 생성 코드 격리 실행 유지
+  - **이미지·영상은 이 태스크에서 만들지 않는다.** desktop 이 표면을 노출하기 전까지
+    보류하고, 보류 사실을 산출물에 남긴다 (`unknown` 으로 남기고 추정하지 않는다)
+  - 시연: 한 포스트에 카피와 기획이 산출되고, 이미지·영상 슬롯은 미충족으로 명시 표기
+  - [ ] 11.1 desktop 에 Studio 외부 표면 요청 — Task 16.0 과 같은 성격의 선행 조건.
+        표면이 생기면 이미지·영상 슬롯을 채운다
   - _Requirements: R5_
 
 - [x] 12. 오염 추적과 인젝션 방어
@@ -145,12 +197,21 @@
   - 시연: `company retro`가 예측 대비 실제와 원인 가설, 레시피 diff를 산출
   - _Requirements: R11_
 
-- [ ] 14. 오피스 API와 콘솔·모바일·라이브오피스
-  - loopback + 사설망 바인딩, 공개 인터페이스 기동 거부, 기기 토큰과 폐기
-  - SSE 원장 tail, 재연결 시 누락 구간 보충, 합성 표시 금지
-  - 데스크톱 Control Room + 모바일 PWA 동일 API, 모바일 전 등급 승인
-  - 시연: 폰에서 진행 중 작업이 실시간으로 보이고 L3까지 승인 가능
+- [ ] 14. 오피스 API와 라이브오피스 — desktop mobile-bridge 연동
+  - **재정의(2026-08-02)**: 모바일 PWA·페어링·릴레이·TLS 를 자체 구현하지 않는다.
+    desktop 의 `mobile-bridge/`(12개 모듈, main.ts 에 기동 확인)에 붙는다
+  - 오피스 API 는 company 가 소유한다 — loopback + 사설망 바인딩, 공개 인터페이스 기동 거부,
+    SSE 원장 tail, 재연결 시 누락 구간 보충, 합성 표시 금지 (R10, R14.1)
+  - 모바일 표면은 desktop 것을 쓴다. `MobileBridgeAuthority` 의 권한 경계와 company 의
+    정책 등급을 **매핑 표로 고정**한다. 두 권한 모델이 어긋나면 낮은 쪽을 택한다
+  - 기기 토큰 폐기는 양쪽 모두에서 동작해야 한다 — desktop 페어링 해제만으로는
+    company 승인 권한이 남는다. 폐기 경로를 한 번에 묶는다
+  - **Task 8.1(실물 단계별 인증)이 여기서 해소된다.** 현재 `--step-up` 은 자리표시자이고,
+    이것이 L3 비가역 작업의 실제 구멍이다. desktop 페어링 기기를 두 번째 요소로 쓴다
+  - 시연: 폰에서 진행 중 작업이 실시간으로 보이고 L3까지 승인 가능, 폐기 후 즉시 거부
   - _Requirements: R10, R14_
+  - _해소: 8.1(단계별 인증), 6.1(War Room 종결 UI)_
+  - _업스트림: agentlas-desktop `electron/mobile-bridge/{server,authority,pairing,runtime}.ts`_
 
 - [x] 15. 레시피와 무인 스케줄
   - [x] 선언적 스텝 5종(seat/gate/approval/publish/retro), YAML 로딩과 검증
@@ -166,13 +227,28 @@
   - [ ] 15.1 예정 시각 무인 시작은 오너가 `company schedule` 출력을 등록해야 동작한다
   - _Requirements: R12_
 
-- [ ] 16. 에이전트 채용
-  - `HIRE` 블록 처리, 패키지 생성 또는 Hub 차용, digest를 `vendor.lock`에 핀
-  - 차용 패키지 무권한 기본값, L3 승인, 좌석 예산 초과 시 거부
-  - 시연: 회의 결정 → 패키지 생성 → 승인 → 다음 사이클에 실제 참여
+- [ ] 16. 에이전트 채용 — desktop Hub 연동
+  - **재정의(2026-08-02)**: Hub·마켓플레이스·패키지 저장을 자체 구현하지 않는다.
+    desktop 의 `cloud-agents/`·`marketplace/`·`hub-bookmark-sync.ts` 가 이미 갖고 있다
+  - [ ] 16.0 **선행 조건 — desktop 게이트 훅.** desktop 의 채용·차용 경로는 `ipcMain` 뒤에
+        있어 헤드리스로 닿지 않는다. 그리고 desktop 외부 MCP 레지스트리에 company 를
+        등록하는 것은 **능력 제공이지 집행이 아니다** — MCP 는 도구를 줄 뿐 호출을
+        가로채지 않는다. 이 구분을 흐리면 원장에 기록만 쌓이고 아무것도 막지 못한다.
+        desktop 쪽에 게이트 훅(차용 전 company 승인 조회)을 넣는 변경이 선행되어야 한다.
+        **이건 desktop 저장소 변경이므로 별도 승인이 필요하다 — 오너 결정 대기**
+  - `HIRE` 블록 처리와 L3 승인은 company 가 소유한다 (통제 계층)
+  - 차용 패키지 digest 를 `vendor.lock` 의 `borrowed_agents` 에 핀 (R13.2 — 이미 자리 있음)
+  - 차용 패키지 무권한 기본값, 좌석 예산 초과 시 거부
+  - 시연: 회의 결정 → desktop Hub 차용 → company L3 승인 → 다음 사이클 참여
   - _Requirements: R13_
+  - _차단: 16.0 (desktop 저장소 변경 승인 필요)_
+  - _업스트림: agentlas-desktop `electron/{cloud-agents,marketplace}/`, `Agentlas-OS`_
 
 - [ ] 17. 무인 운영과 침해 복구
+  - **재정의 없음 — 자체 구현으로 남는다(2026-08-02 확인).** desktop 의
+    `automation-{scheduler,watchdog,recovery,strategy}.ts`(2,382줄)는 desktop 자신의
+    자동화를 감독하는 것이고 company 서비스의 무인 복귀와 대상이 다르다. 다만 desktop 이
+    함께 뜨지 않으면 Task 10·14 가 죽으므로, 복귀 검증에 **desktop 기동 확인을 포함**한다
   - 재부팅 무인 복귀, 원장 무손실 검증, 스위치 전부 OFF 복귀
   - 좌석 만료 알림, 이상 볼륨·`deny` 급증 시 정지, 일일 요약
   - OAuth 그랜트 폐기 순서와 복구 런북 작성 후 **1회 실전 연습**

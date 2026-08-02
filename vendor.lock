@@ -26,6 +26,29 @@ upstreams:
     commit: dd12f6201587d649900fb3955dfff27c98da5e07
     consumes: "에이전트 패키지 build/borrow, Hub 차용"
 
+  agentlas-desktop:
+    repo: https://github.com/contentscoin/agentlas-desktop.git
+    commit: 537a3a1725d1395ff8480acf5523499c822436e0
+    consumes: "computer-use 제어 서버(Hands 실행 표면), mobile-bridge(모바일 승인 표면), 외부 MCP 레지스트리(통제 계층 등록 지점)"
+    notes: |
+      2026-08-02 추가. Agentlas Desktop v0.9.29, Electron+Next, TS/TSX 627개 파일.
+      네 업스트림과 달리 이건 '실행 표면'을 이미 가진 형제 제품이다. Task 9~17 계획을
+      세울 때 이 저장소를 몰랐고, 그래서 Hands·모바일을 처음부터 만들 계획이었다.
+
+      헤드리스로 닿는 표면은 넷뿐이다 — 나머지는 electron/ipc.ts 의 ipcMain 핸들러
+      486개 뒤에 있어 Electron 렌더러에서만 호출된다. 이 486이 연동 범위를 정한다.
+        - electron/computer-use/control-server.ts  loopback HTTP + Bearer, control.json
+        - electron/mobile-bridge/server.ts          HTTPS/WSS + 페어링 + authority
+        - electron/browser/approval-server.ts       브라우저 승인 채널
+        - electron/mcp-tools/registry.ts            외부 MCP 레지스트리(stdio/sse/http)
+
+      재사용 불가 확인 사항 (추정 아님, 소스 확인):
+        - 채널 발행 구현 없음. creative-pack/ecommerce-pack 은 surface.ts 하나씩이고
+          threads·instagram 은 experience/taxonomy.ts 와 mcp-tools/catalog.ts 의
+          문자열일 뿐이다. Task 9 는 재사용 자산이 없다.
+        - MCP 레지스트리 등록은 '능력 제공'이지 '집행'이 아니다. desktop 이 우리 게이트를
+          거치게 하려면 desktop 쪽 변경이 필요하다. Task 16.0 이 그 선행 조건이다.
+
 # proc.js 에서 확인된 재사용 대상 (Task 2 에서 @company/proc 으로 추출)
 # 원문 인용 — 이 주석들이 추출 근거다
 #   L1-2  "GUI apps don't inherit the terminal PATH, and Node's

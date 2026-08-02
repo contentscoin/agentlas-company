@@ -74,6 +74,27 @@ flowchart TB
     LED -->|"SSE tail"| OWNER
 ```
 
+## agentlas-desktop 경계
+
+`agentlas-desktop`(v0.9.29, Electron+Next, TS/TSX 627개)은 형제 제품이고 **실행 표면을 이미 가졌습니다.** Task 9~17 을 세울 때 이 저장소를 계산에 넣지 않았고, 그래서 Hands·모바일·Studio·채용을 처음부터 만들 계획이었습니다. 그 계획을 정정합니다.
+
+**분업 원칙: company 는 통제, desktop 은 실행.** company 가 고유하게 가진 것은 desktop 에 없습니다 — 해시체인 원장, 정책 등급·승인 게이트, 능력 스위치, 오염 추적, 크로스벤더 회의 프로토콜. desktop 이 가진 것은 company 에 없습니다 — 네이티브 입력 드라이버, CDP 브라우저, 모바일 페어링·릴레이, 좌석 런타임 어댑터 7종(11,185줄). 겹치는 것을 두 번 만들지 않습니다.
+
+**연동 가능 범위는 헤드리스 도달성이 정합니다.** desktop 기능의 대부분은 `electron/ipc.ts` 의 `ipcMain.handle` **486개** 뒤에 있고, 이건 Electron 렌더러에서만 호출됩니다. company 는 헤드리스 CLI이므로 닿지 않습니다. 밖으로 나온 표면은 넷뿐입니다.
+
+| desktop 표면 | 프로토콜 | company 쪽 소비자 |
+|---|---|---|
+| `computer-use/control-server.ts` | loopback HTTP + `Authorization: Bearer` | Hands Executor (Task 10) |
+| `mobile-bridge/server.ts` | HTTPS/WSS + 페어링 + authority | 오피스 API·모바일 승인 (Task 14) |
+| `browser/approval-server.ts` | loopback HTTP | 승인 흐름 보조 (Task 7) |
+| `mcp-tools/registry.ts` | 외부 MCP 등록 (stdio/sse/http) | company 를 도구로 등록 (Task 16) |
+
+computer-use 의 계약은 정확합니다. 제어 파일 `<userData>/computer-use/control.json` 이 `{ schemaVersion: 1, port, token }` 을 mode `0600` 으로 쓰고, 환경변수 `AGENTLAS_COMPUTER_USE_CONTROL_FILE` 이 그 경로를 가리키며, 도구는 16종(`computer_status`, `click`, `type_text`, `press_key` 등)입니다. Task 10 은 이 계약에 바인딩하고 desktop 내부 구현에는 의존하지 않습니다 — Python 업스트림을 `--json` 계약으로만 소비하는 것과 같은 규칙입니다.
+
+**MCP 등록은 집행이 아닙니다.** desktop 의 외부 MCP 레지스트리에 company 를 stdio 서버로 올리면 desktop 안의 에이전트가 원장 기록·승인 요청을 **할 수 있게** 됩니다. 하지만 desktop 자신의 동작이 우리 게이트를 **거치지는** 않습니다. MCP 는 도구를 제공하지 호출을 가로채지 않습니다. 통제 계층이 실제로 집행되려면 desktop 쪽에 게이트 훅이 필요하고, 그것이 Task 16.0 의 내용입니다. 이 구분을 흐리면 "초록인데 틀린 상태"가 됩니다 — 원장에 기록은 쌓이는데 아무것도 막지 못하는 상태.
+
+**재사용 자산이 없는 것도 확정했습니다.** desktop 에 채널 발행 구현은 없습니다. `creative-pack/`·`ecommerce-pack/` 은 각각 `surface.ts` 하나이고 `threads`·`instagram` 은 `experience/taxonomy.ts` 와 `mcp-tools/catalog.ts` 의 문자열입니다. 따라서 **Task 9(첫 발행 루프)는 그대로 company 의 자체 구현으로 남습니다.** 요구사항의 "빈 기계 리스크"가 지목한 우선순위는 이 정정 이후에도 유효합니다.
+
 ## Seat Broker
 
 ```ts
