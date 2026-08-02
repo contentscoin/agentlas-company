@@ -13,10 +13,12 @@ import { RecipeEngine, buildSeatPrompt } from './engine.js';
 import { RecipeError, loadRecipe, validateRecipe } from './load.js';
 import { RunLock } from './lock.js';
 import { emitForPlatform, launchdPlist, parseSchedule, schtasksCommand, systemdUnits } from './schedule.js';
-import type { Recipe } from './types.js';
+import type { Recipe, RetroStep } from './types.js';
 import { PublishBroker } from '../publish/broker.js';
 import { PublishStore } from '../publish/ledgerstore.js';
 import type { ChannelAdapter } from '../publish/types.js';
+import { MetricsBroker } from '../metrics/broker.js';
+import type { MetricsAdapter } from '../metrics/types.js';
 
 let dir: string;
 let ledger: Ledger;
@@ -409,6 +411,78 @@ describe('발행 스텝 (R6, R12)', () => {
     const outcome = await engine.start(RECIPE({ brandOk: true }));
     expect(outcome.status).toBe('failed');
     expect(outcome.reason).toContain('토큰을 설정하세요');
+  });
+});
+
+/** 지표 브로커를 물린 엔진. 어댑터는 주어진 원본을 그대로 돌려준다. */
+function buildWithMetrics(raw: unknown, over: Partial<MetricsAdapter> = {}): RecipeEngine {
+  ledger = Ledger.open(join(dir, 'events.jsonl'));
+  const broker = new SeatBroker({
+    ledger,
+    seats: [fakeSeat('codex', 'openai'), fakeSeat('claude', 'anthropic')],
+    runner: echoRunner,
+  });
+  const approvals = new ApprovalService({ policy: POLICY, ledger, file: join(dir, 'approvals.json') });
+  const metrics = new MetricsBroker({
+    ledger,
+    adapters: [
+      {
+        channel: 'smartstore',
+        path: 'hands',
+        metrics: ['orderCount', 'revenue'],
+        ready: () => ({ ok: true }),
+        read: async () => ({ ok: true as const, raw }),
+        ...over,
+      } as MetricsAdapter,
+    ],
+  });
+  return new RecipeEngine({ ledger, broker, approvals, policy: POLICY, stateDir: dir, metrics });
+}
+
+const RETRO_RECIPE = (retro: Partial<RetroStep>): Recipe => ({
+  name: 'retro',
+  steps: [
+    { id: 'draft', kind: 'seat', persona: 'studio', instruction: '초안', produce: 'draft' },
+    { id: 'r', kind: 'retro', afterDays: 7, subject: 'draft', expect: { orderCount: 100 }, ...retro },
+  ],
+});
+
+describe('복기가 실측을 읽는다 (R11.6)', () => {
+  it('채널이 지정되면 지표를 수집해 예측과 견준다', async () => {
+    const engine = buildWithMetrics({ orderCount: 128, revenue: 3450000 });
+    const outcome = await engine.start(RETRO_RECIPE({ channel: 'smartstore' }));
+    expect(outcome.status).toBe('completed');
+    const state = engine.loadRun(outcome.runId)!;
+    // 실측이 들어왔으므로 "수집 못 함" 이 0 이다.
+    expect(state.steps.find((s) => s.id === 'r')?.detail).toContain('수집 못 함 0');
+  });
+
+  it('채널이 없으면 실측 없이 돌고 그 사실을 남긴다', async () => {
+    const engine = buildWithMetrics({ orderCount: 128 });
+    const outcome = await engine.start(RETRO_RECIPE({}));
+    expect(outcome.status).toBe('completed');
+    const detail = engine.loadRun(outcome.runId)!.steps.find((s) => s.id === 'r')?.detail ?? '';
+    expect(detail).toContain('수집 못 함 1');
+    expect(detail).toContain('채널 미지정');
+  });
+
+  it('수집이 실패해도 0 으로 채우지 않는다', async () => {
+    const engine = buildWithMetrics(null, {
+      read: async () => ({ ok: false as const, detail: '화면 없음', checklist: [] }),
+    });
+    const outcome = await engine.start(RETRO_RECIPE({ channel: 'smartstore' }));
+    expect(outcome.status).toBe('completed');
+    const detail = engine.loadRun(outcome.runId)!.steps.find((s) => s.id === 'r')?.detail ?? '';
+    // 실패는 미수집이지 0 이 아니다 — 0 이면 "성과 없음" 으로 읽혀 레시피를 잘못 고친다.
+    expect(detail).toContain('수집 못 함 1');
+    expect(detail).toContain('화면 없음');
+  });
+
+  it('채널이 낸 지표에 고객 정보가 섞여 있어도 복기로 넘어가지 않는다 (R7.6)', async () => {
+    const engine = buildWithMetrics({ orderCount: 3, buyerName: '김OO' });
+    const outcome = await engine.start(RETRO_RECIPE({ channel: 'smartstore' }));
+    const state = engine.loadRun(outcome.runId)!;
+    expect(JSON.stringify(state)).not.toContain('김OO');
   });
 });
 

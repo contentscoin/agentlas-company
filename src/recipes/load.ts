@@ -101,6 +101,11 @@ export function validateRecipe(value: unknown): string[] {
       } else if (!Object.values(expect as Record<string, unknown>).every((v) => typeof v === 'number')) {
         problems.push(`${at}.expect 의 값은 전부 숫자여야 한다`);
       }
+      // 채널을 적었으면 실제 채널이어야 한다. 실행 중에 알면 발행이 이미 끝난 뒤다.
+      const ch = s['channel'];
+      if (ch !== undefined && (typeof ch !== 'string' || !isChannel(ch))) {
+        problems.push(`${at}.channel 이 알 수 없는 채널이다: ${String(ch)}`);
+      }
     }
   });
 

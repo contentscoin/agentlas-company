@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Ledger } from '../ledger/ledger.js';
 import { McpClient } from './mcp.js';
 import {
   HandsExecutor,
+  browserClientOptions,
   checklistFrom,
   planDigest,
   toolArguments,
@@ -260,5 +261,35 @@ describe('checklistFrom', () => {
     const list = checklistFrom([{ op: 'type', element: '본문', ref: 'e1', text: '비밀글' }], 0);
     expect(list[0]).toContain('3자');
     expect(list[0]).not.toContain('비밀글');
+  });
+});
+
+describe('MCP 서버의 작업 디렉터리 (R15)', () => {
+  /**
+   * playwright-mcp 는 스냅샷 원문을 CWD 밑 `.playwright-mcp/` 에 쓴다.
+   * 접근성 트리 전문이라 고객 이름·연락처·주소가 평문으로 들어가고,
+   * 실제로 저장소 작업트리에 0644 로 떨어졌다.
+   */
+  it('프로세스 CWD 를 물려주지 않는다', () => {
+    const surface = { ok: true, launcher: '/tmp/launcher.mjs', approvalFile: null, problems: [], detail: [] };
+    const opts = browserClientOptions(surface, join(dir, 'hands-work'));
+    expect(opts.cwd).toBe(join(dir, 'hands-work'));
+    expect(opts.cwd).not.toBe(process.cwd());
+  });
+
+  it('기본 경로로 서버를 띄우면 작업 디렉터리가 소유자 전용으로 생긴다', async () => {
+    const server = fakeServer('ok');
+    const work = join(dir, 'work');
+    // createClient 를 넘기지 않는다 — 기본 팩토리가 도는지가 이 시험의 대상이다.
+    const ex = new HandsExecutor({
+      ledger,
+      workDir: work,
+      inspect: () => ({ ok: true, launcher: server, approvalFile: null, problems: [], detail: [] }),
+    });
+    const r = await ex.run({ steps: [{ op: 'snapshot' }], gateAllowed: true });
+    expect(r.ok).toBe(true);
+    expect(existsSync(work)).toBe(true);
+    if (process.platform === 'win32') return; // Windows 는 ACL 이 담당한다
+    expect(statSync(work).mode & 0o777).toBe(0o700);
   });
 });

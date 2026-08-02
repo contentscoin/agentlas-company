@@ -14,6 +14,12 @@
  *
  * 실패는 조용히 성공이 되지 않는다 (R7.5). 중단 지점까지의 결과와 사람이
  * 이어받을 체크리스트를 함께 돌려준다.
+ *
+ * **MCP 서버의 작업 디렉터리를 우리가 정한다 (R15).** `@playwright/mcp` 는
+ * 스냅샷을 자기 CWD 밑 `.playwright-mcp/` 에 그대로 쓴다 — 접근성 트리
+ * 전문이므로 고객 이름·연락처·주소가 평문으로 들어간다. 그대로 두면 우리가
+ * 좌석 경계에서 아무리 접어도 원문이 저장소 작업트리에 0644 로 떨어진다.
+ * 실제로 그랬다. 소유자 전용 디렉터리를 만들어 거기서 돌린다.
  */
 
 import { createHash } from 'node:crypto';
@@ -22,7 +28,9 @@ import { join } from 'node:path';
 import type { Ledger } from '../ledger/ledger.js';
 import { HANDS_TOOL, findPattern, isFindRef, planNeedsDesktop, type HandsStep } from './types.js';
 import { inspectSurface, type Surface } from './locate.js';
-import { McpClient } from './mcp.js';
+import { McpClient, type McpClientOptions } from './mcp.js';
+import { ensurePrivateDir } from '../zones/private.js';
+import { resolveState } from '../paths.js';
 
 export interface HandsStepResult {
   index: number;
@@ -90,6 +98,15 @@ export interface HandsExecutorOptions {
    * 없는데도 도는 것처럼 보인다. 테스트가 가짜 MCP 서버를 물릴 때만 쓴다.
    */
   inspect?: (requireDesktop: boolean) => Surface;
+  /**
+   * MCP 서버를 돌릴 작업 디렉터리.
+   *
+   * playwright-mcp 가 스냅샷 원문을 CWD 밑에 쓰기 때문에 반드시 소유자
+   * 전용이어야 한다. 기본값은 상태 디렉터리 밑 `hands-work/` 이고, 없으면
+   * 만들면서 0700 을 준다. **프로세스 CWD 를 그대로 물려주지 않는다** —
+   * 그것이 저장소 작업트리이면 고객 정보가 거기 떨어진다.
+   */
+  workDir?: string;
 }
 
 /** 계획의 digest. 승인은 이 값에 묶인다 (R4.6). */
@@ -182,29 +199,45 @@ export function checklistFrom(steps: readonly HandsStep[], failedAt: number): st
   });
 }
 
+/**
+ * 브라우저 MCP 서버를 띄우는 인자.
+ *
+ * `cwd` 가 핵심이다 — playwright-mcp 는 스냅샷 원문을 CWD 밑에 쓴다.
+ * 프로세스 CWD 를 물려주면 그것이 저장소 작업트리일 때 고객 이름·연락처가
+ * 평문 파일로 떨어진다.
+ */
+export function browserClientOptions(surface: Surface, workDir: string): McpClientOptions {
+  return {
+    command: process.execPath,
+    args: [surface.launcher],
+    cwd: workDir,
+    env: {
+      ...process.env,
+      ...(surface.approvalFile ? { AGENTLAS_BROWSER_APPROVAL_FILE: surface.approvalFile } : {}),
+    },
+  };
+}
+
 export class HandsExecutor {
   private readonly ledger: Ledger;
   private readonly createClient: (surface: Surface) => McpClient;
   private readonly inspect: (requireDesktop: boolean) => Surface;
   private readonly requireDesktop: boolean | undefined;
+  private readonly workDir: string;
 
   constructor(opts: HandsExecutorOptions) {
     this.ledger = opts.ledger;
     this.requireDesktop = opts.requireDesktop;
     this.inspect = opts.inspect ?? ((requireDesktop): Surface => inspectSurface({ requireDesktop }));
+    this.workDir = opts.workDir ?? join(resolveState(), 'hands-work');
     this.createClient =
       opts.createClient ??
-      ((surface) =>
-        new McpClient({
-          command: process.execPath,
-          args: [surface.launcher],
-          env: {
-            ...process.env,
-            ...(surface.approvalFile
-              ? { AGENTLAS_BROWSER_APPROVAL_FILE: surface.approvalFile }
-              : {}),
-          },
-        }));
+      ((surface) => {
+        // 서버를 띄우기 직전에 만든다 — 가짜 클라이언트를 쓰는 테스트가
+        // 디렉터리를 만들 이유는 없다.
+        ensurePrivateDir(this.workDir);
+        return new McpClient(browserClientOptions(surface, this.workDir));
+      });
   }
 
   private deny(reason: HandsFailure, detail: string, input: HandsRunInput): HandsRunResult {

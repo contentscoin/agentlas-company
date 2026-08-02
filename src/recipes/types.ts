@@ -94,6 +94,11 @@ export interface RetroStep extends StepBase {
   subject: string;
   /** 지표 이름 → 예측값. 없으면 복기할 것이 없다. */
   expect?: Record<string, number>;
+  /** 지표를 읽을 채널. 없으면 실측 없이 복기한다. */
+  channel?: string;
+  /** 집계 구간. 채널이 있을 때만 쓰인다. */
+  from?: string;
+  to?: string;
 }
 
 export type Step = SeatStep | GateStep | ApprovalStep | PublishStep | RetroStep;

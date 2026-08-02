@@ -28,10 +28,12 @@ import type { ApprovalService } from '../policy/approval.js';
 import { classify } from '../policy/policy.js';
 import type { PolicyConfig } from '../policy/types.js';
 import { RunLock } from './lock.js';
-import type { Recipe, RunOutcome, RunState, Step, StepState } from './types.js';
+import type { Recipe, RetroStep, RunOutcome, RunState, Step, StepState } from './types.js';
 import type { PublishBroker } from '../publish/broker.js';
 import { isChannel } from '../verbs/types.js';
 import { compare, noPrediction } from '../assurance/retro.js';
+import type { Observed } from '../assurance/retro.js';
+import type { MetricsBroker } from '../metrics/broker.js';
 
 export interface EngineOptions {
   ledger: Ledger;
@@ -50,6 +52,13 @@ export interface EngineOptions {
    * 않는다** — 발행 스텝이 있는데 발행기가 없으면 그 자리에서 멈춘다.
    */
   publisher?: PublishBroker;
+  /**
+   * 지표 브로커. 없으면 복기가 실측 없이 돈다.
+   *
+   * 없는 것을 실패로 만들지 않는 이유는, 실측 없는 복기도 "측정을 먼저
+   * 고치라" 는 제안을 내기 때문이다 — 그것이 지금 가장 쓸모 있는 산출이다.
+   */
+  metrics?: MetricsBroker;
 }
 
 export class RecipeEngine {
@@ -57,6 +66,7 @@ export class RecipeEngine {
   private readonly broker: SeatBroker;
   private readonly approvals: ApprovalService;
   private readonly publisher: PublishBroker | undefined;
+  private readonly metrics: MetricsBroker | undefined;
   private readonly policy: PolicyConfig;
   private readonly stateDir: string;
   private readonly gateTimeoutMs: number;
@@ -69,6 +79,7 @@ export class RecipeEngine {
     this.stateDir = opts.stateDir;
     this.gateTimeoutMs = opts.gateTimeoutMs ?? 120_000;
     this.publisher = opts.publisher;
+    this.metrics = opts.metrics;
     mkdirSync(join(this.stateDir, 'runs'), { recursive: true });
   }
 
@@ -397,12 +408,14 @@ export class RecipeEngine {
           return 'stop';
         }
 
-        // 지표 수집 경로가 아직 없다 (`read_metrics` 어댑터 부재). 실측을
-        // 주입받지 못했으므로 전부 "수집 못 함" 이고, 그 사실이 제안 맨
-        // 위에 올라간다 — 0 으로 채우면 레시피를 잘못 고치게 된다.
-        // 복기 대상은 발행 스텝의 id 다. 채널까지 끌어오려면 레시피 전체를
-        // 여기로 넘겨야 하는데, 표시용 이름 하나 때문에 그럴 이유가 없다 —
-        // 어느 스텝의 성과인지가 분명하면 충분하다.
+        // 채널이 지정되면 실측을 읽는다. 브로커가 없거나 수집이 실패하면
+        // **0 으로 채우지 않고** null 을 넘긴다 — 전부 "수집 못 함" 이 되고
+        // 그 사실이 제안 맨 위에 올라간다 (R11.6). 못 읽은 것을 0 으로 보면
+        // "성과가 없었다" 로 읽혀 레시피를 잘못 고치게 된다.
+        // 복기 대상(`subject`)은 발행 스텝의 id 이고, 지표를 읽을 채널은
+        // 별도 필드다 — 스텝 하나가 여러 채널로 나갈 수 있다.
+        const observed = await this.collectActuals(step, state.runId);
+
         const retro = compare(
           {
             runId: state.runId,
@@ -411,7 +424,7 @@ export class RecipeEngine {
             afterDays: step.afterDays,
             at: new Date().toISOString(),
           },
-          null,
+          observed.actual,
         );
 
         this.ledger.append({
@@ -420,15 +433,54 @@ export class RecipeEngine {
           runId: state.runId,
           summary:
             `복기 ${step.subject} — 지표 ${retro.gaps.length}건, ` +
-            `수집 못 함 ${retro.uncollected.length}건`,
+            `수집 못 함 ${retro.uncollected.length}건` +
+            (observed.why ? ` (${observed.why})` : ''),
         });
 
         state.artifacts[`${step.id}.amendments`] = retro.amendments.join('\n');
         st.status = 'passed';
-        st.detail = `복기 완료 — 제안 ${retro.amendments.length}건 (수집 못 함 ${retro.uncollected.length})`;
+        st.detail =
+          `복기 완료 — 제안 ${retro.amendments.length}건 (수집 못 함 ${retro.uncollected.length})` +
+          (observed.why ? ` — ${observed.why}` : '');
         return 'continue';
       }
     }
+  }
+
+  /**
+   * 복기 실측을 읽는다 (R11.6).
+   *
+   * 못 읽었으면 `null` 을 돌려준다. 빈 객체가 아니다 — 빈 객체도 `compare` 가
+   * 미수집으로 처리하긴 하지만, **왜** 못 읽었는지를 같이 남겨야 다음 주에
+   * 고칠 수 있다. "지표가 안 나왔다" 와 "토큰이 없다" 는 다른 문제다.
+   */
+  private async collectActuals(
+    step: RetroStep,
+    runId: string,
+  ): Promise<{ actual: Observed | null; why: string | null }> {
+    if (!step.channel) return { actual: null, why: '채널 미지정 — 실측 없이 복기' };
+    if (!this.metrics) return { actual: null, why: '지표 브로커 없음' };
+    if (!isChannel(step.channel)) return { actual: null, why: `${step.channel} 은 알 수 없는 채널` };
+
+    const today = new Date().toISOString().slice(0, 10);
+    const outcome = await this.metrics.read(step.channel, {
+      from: step.from ?? today,
+      to: step.to ?? today,
+    });
+    if (!outcome.ok) return { actual: null, why: `지표 수집 실패 — ${outcome.detail}` };
+
+    // 집계값만 넘어온다 — 경계는 브로커가 이미 집행했다 (R7.6).
+    const actual: Record<string, number> = {};
+    for (const [k, v] of Object.entries(outcome.result.aggregate)) {
+      if (typeof v === 'number') actual[k] = v;
+    }
+    return {
+      actual: { runId, actual, at: new Date().toISOString() },
+      why:
+        outcome.result.uncollected.length > 0
+          ? `채널 미수집 ${outcome.result.uncollected.join(', ')}`
+          : null,
+    };
   }
 }
 

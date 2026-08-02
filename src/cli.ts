@@ -51,6 +51,10 @@ import { checkHealth } from './ops/health.js';
 import { detectAnomalies, describeAnomaly, unreadableLedger } from './ops/anomaly.js';
 import { buildDigest, renderDigest } from './ops/digest.js';
 import { registerClaims, describeClaim } from './assurance/claims.js';
+import { MetricsBroker } from './metrics/broker.js';
+import { ThreadsMetricsAdapter } from './metrics/adapters/threads.js';
+import { SmartstoreMetricsAdapter } from './metrics/adapters/smartstore.js';
+import { isChannel } from './verbs/types.js';
 import { assure, describeFinding as describeAssurance } from './assurance/checks.js';
 import { DEFAULT_VERB_POLICY } from './verbs/types.js';
 import { ApprovalService } from './policy/approval.js';
@@ -394,6 +398,15 @@ function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalS
     evidenceRoot: join(resolveState(), 'evidence'),
     notify: (m) => note(`  알림 → 오너: ${m}`),
   });
+  // 지표 브로커도 함께 물린다. 없으면 복기가 실측 없이 돌고, 그 사실이
+  // 복기 제안 맨 위에 올라간다.
+  const metrics = new MetricsBroker({
+    ledger,
+    adapters: [
+      new ThreadsMetricsAdapter(),
+      new SmartstoreMetricsAdapter({ hands: new HandsExecutor({ ledger }) }),
+    ],
+  });
   const engine = new RecipeEngine({
     ledger,
     broker,
@@ -401,6 +414,7 @@ function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalS
     policy,
     stateDir: resolveState(),
     publisher,
+    metrics,
   });
   return { engine, approvals };
 }
@@ -1459,6 +1473,73 @@ function extractCitationLines(text: string): string[] {
   return [...cites];
 }
 
+/**
+ * 지표 수집 (R11.6, R7.6).
+ *
+ * 좌석으로 넘어가는 것은 집계값뿐이다. 막힌 필드는 이름만 보고한다.
+ */
+async function cmdMetrics(argv: string[]): Promise<number> {
+  const channel = flagValue(argv, '--channel');
+  if (!channel || !isChannel(channel)) {
+    process.stderr.write(
+      '사용법: company metrics --channel <채널> [--from YYYY-MM-DD] [--to YYYY-MM-DD]\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  const ledger = Ledger.open(ledgerPath(argv));
+  const broker = new MetricsBroker({
+    ledger,
+    adapters: [
+      new ThreadsMetricsAdapter(),
+      new SmartstoreMetricsAdapter({
+        hands: new HandsExecutor({ ledger }),
+        ...(flagValue(argv, '--stats-url') ? { statsUrl: flagValue(argv, '--stats-url') as string } : {}),
+      }),
+    ],
+  });
+
+  const today = new Date().toISOString().slice(0, 10);
+  const outcome = await broker.read(channel, {
+    from: flagValue(argv, '--from') ?? today,
+    to: flagValue(argv, '--to') ?? today,
+  });
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut(outcome);
+    return outcome.ok ? EXIT_OK : EXIT_FINDING;
+  }
+
+  if (!outcome.ok) {
+    out(`지표 수집 실패 — ${outcome.reason}: ${outcome.detail}`);
+    for (const line of outcome.checklist) out(`  ${line}`);
+    return EXIT_FINDING;
+  }
+
+  const r = outcome.result;
+  out(`${r.channel} 지표 — ${r.window.from} ~ ${r.window.to}`);
+  out('');
+  const entries = Object.entries(r.aggregate);
+  if (entries.length === 0) out('  수집된 지표 없음');
+  for (const [k, v] of entries) out(`  ${k.padEnd(20)} ${v}`);
+  if (r.uncollected.length > 0) {
+    out('');
+    out(`미수집: ${r.uncollected.join(', ')} (0 으로 채우지 않습니다)`);
+  }
+  if (r.dropped.length > 0) {
+    out('');
+    out(`경계에서 차단: ${r.dropped.join(', ')}`);
+    out('  좌석으로 넘어가는 것은 집계값뿐입니다 (R7.6). 값은 표시하지 않습니다.');
+  }
+  for (const n of r.notes) out(`  ${n}`);
+  if (r.flagged.length > 0) {
+    out('');
+    out(`린트로 폐기한 메모: ${r.flagged.length}건 (R15.5)`);
+    for (const f of r.flagged) out(`  ${f}`);
+  }
+  return EXIT_OK;
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
   const sub = subcommand(argv);
@@ -1575,6 +1656,9 @@ function usage(): void {
   out('  company publish --verb <동사.json> [--key <멱등키>] [--dry-run] [--brand-ok]');
   out('      동사는 파일로만 받습니다. 자유 텍스트를 받는 인자는 없습니다');
   out('');
+  out('  지표 (R11.6, R7.6) — 좌석으로 넘어가는 것은 집계값뿐이다');
+  out('  company metrics --channel smartstore [--from …] [--to …]');
+  out('');
   out('  검증 (R11) — 클레임 등록과 결정론적 검사. BLOCK 은 발행을 막는다');
   out('  company assure <산출물.txt> [--facts <팩.json>]');
   out('');
@@ -1638,6 +1722,8 @@ async function main(): Promise<number> {
         return cmdOps(argv);
       case 'assure':
         return cmdAssure(argv);
+      case 'metrics':
+        return await cmdMetrics(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':
