@@ -6,6 +6,18 @@ import { brokerAssets, seatOauthDirs, zoneLayout, ZONE_ACCOUNTS } from './layout
 import { checkPosix, parseIcacls, scanForbidden, verifyZones } from './verify.js';
 import { writePrivateFile } from './private.js';
 
+/**
+ * POSIX mode 를 전제로 하는 검사.
+ *
+ * Windows 에서는 **전제 자체를 만들 수 없다** — `chmod 0600` 을 걸어도 Node 는
+ * `0666`(쓰기 가능) 또는 `0444`(읽기 전용)로만 보고한다. 그 위에서 POSIX
+ * 규칙을 시험하는 것은 코드가 아니라 OS 를 시험하는 것이다.
+ *
+ * 건너뛰는 대신 `checkPosix` 가 Windows 에서 `unknown` 을 내는지는 아래에서
+ * 별도로 확인한다 — 플랫폼을 인자로 받으므로 어디서든 시험할 수 있다.
+ */
+const isWindows = process.platform === 'win32';
+
 let dir: string;
 
 beforeEach(() => {
@@ -13,7 +25,21 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-describe('checkPosix', () => {
+describe('checkPosix — 플랫폼 판정', () => {
+  it('Windows 에서는 판정하지 않는다 — mode 가 POSIX 의미를 갖지 않는다', () => {
+    const file = join(dir, 'w.json');
+    writePrivateFile(file, '{}');
+    const result = checkPosix(file, 'win32');
+    expect(result.verdict).toBe('unknown');
+    expect(result.detail).toContain('icacls');
+  });
+
+  it('없는 파일은 확인 불가다 — 통과가 아니다', () => {
+    expect(checkPosix(join(dir, 'missing'), 'linux').verdict).toBe('unknown');
+  });
+});
+
+describe.skipIf(isWindows)('checkPosix — POSIX mode', () => {
   it('소유자 전용이면 닫힘', () => {
     const file = join(dir, 'a.json');
     writePrivateFile(file, '{}');
@@ -34,9 +60,6 @@ describe('checkPosix', () => {
     expect(checkPosix(file).verdict).toBe('violation');
   });
 
-  it('없는 파일은 확인 불가다 — 통과가 아니다', () => {
-    expect(checkPosix(join(dir, 'missing')).verdict).toBe('unknown');
-  });
 });
 
 describe('parseIcacls', () => {
@@ -68,7 +91,7 @@ describe('parseIcacls', () => {
   });
 });
 
-describe('verifyZones', () => {
+describe.skipIf(isWindows)('verifyZones — 실제 파일 권한', () => {
   it('열려 있는 자산을 잡는다', () => {
     const file = join(dir, 'events.jsonl');
     writeFileSync(file, '');
@@ -99,6 +122,9 @@ describe('verifyZones', () => {
     expect(report.ok).toBe(true);
   });
 
+});
+
+describe('verifyZones — 파일 권한과 무관한 규칙', () => {
   it('아무도 거부되지 않는 자산은 검사 대상이 아니다', () => {
     const report = verifyZones({
       entries: [

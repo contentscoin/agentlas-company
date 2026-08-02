@@ -52,8 +52,25 @@ function deniedAccounts(entry: ZoneEntry): ZoneAccount[] {
  * 그룹·기타 비트가 하나라도 서 있으면 소유자 외에 열려 있는 것이다.
  * 소유자가 누구인지까지는 보지 않는다 — 계정 이름 매핑은 배치마다 다르고,
  * 여기서 중요한 것은 "타인에게 열려 있는가" 다.
+ *
+ * **Windows 에서는 판정하지 않는다.** Node 가 Windows 에서 돌려주는 mode 는
+ * POSIX 비트가 아니다 — 쓰기 가능하면 `0666`, 읽기 전용이면 `0444` 로
+ * 뭉뚱그린다. 그 값을 POSIX 규칙으로 읽으면 실제로는 잠긴 파일을
+ * `violation` 으로 보고한다. CI(windows-latest)가 정확히 그것을 잡았다.
+ *
+ * 이 모듈의 원칙은 "확인하지 못한 것을 통과로 보고하지 않는다" 인데,
+ * **위반으로 보고해서도 안 된다.** 거짓 경보는 진짜 경보를 묻는다.
  */
-export function checkPosix(path: string): { verdict: Verdict; detail: string } {
+export function checkPosix(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): { verdict: Verdict; detail: string } {
+  if (platform === 'win32') {
+    return {
+      verdict: 'unknown',
+      detail: 'Windows 에서는 POSIX mode 가 의미를 갖지 않는다 — icacls 로 판정한다',
+    };
+  }
   try {
     const st = statSync(path);
     const mode = st.mode & 0o777;
@@ -150,7 +167,7 @@ export function verifyZones(opts: VerifyOptions): VerifyReport {
     const result =
       platform === 'win32'
         ? checkWindows(entry.path, ZONE_ACCOUNTS.seats)
-        : checkPosix(entry.path);
+        : checkPosix(entry.path, platform);
     rows.push({ label: entry.label, path: entry.path, deniedTo: denied, ...result });
   }
 
