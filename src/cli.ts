@@ -43,6 +43,10 @@ import { describeFinding, lint } from './zones/lint.js';
 import { Studio } from './studio/studio.js';
 import { describeSlots, publishReadiness, SLOT_KINDS, type SlotKind } from './studio/artifact.js';
 import type { BrandPack } from './studio/brandpack.js';
+import { HireBroker, hireDigest } from './hire/hire.js';
+import { readBorrowed } from './hire/lock.js';
+import { parseCloseBlock, type HireRequest } from './org/protocol.js';
+import { ALL_PERSONAS } from './org/personas.js';
 import { DEFAULT_VERB_POLICY } from './verbs/types.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
@@ -1166,6 +1170,121 @@ async function cmdStudio(argv: string[]): Promise<number> {
   return readiness.ready ? EXIT_OK : EXIT_FINDING;
 }
 
+/**
+ * 채용 (R13).
+ *
+ * 회의 마감 블록의 `HIRE:` 를 읽어 채용을 진행한다. 명령줄에서 대상을 직접
+ * 받는 인자도 두는데, 회의 없이 오너가 직접 들이는 경우가 있기 때문이다 —
+ * 어느 쪽이든 L3 승인은 같다.
+ */
+async function cmdHire(argv: string[]): Promise<number> {
+  const sub = subcommand(argv);
+  const lockFile = flagValue(argv, '--lock') ?? join(process.cwd(), 'vendor.lock');
+
+  let lockText: string;
+  try {
+    lockText = readFileSync(lockFile, 'utf8');
+  } catch (err) {
+    process.stderr.write(`vendor.lock 을 읽지 못했습니다: ${(err as Error).message}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  if (sub === 'list') {
+    const agents = readBorrowed(lockText);
+    if (hasFlag(argv, '--json')) {
+      jsonOut({ borrowed: agents });
+      return EXIT_OK;
+    }
+    if (agents.length === 0) {
+      out('차용된 에이전트 없음');
+      return EXIT_OK;
+    }
+    for (const a of agents) {
+      out(`${a.id}`);
+      out(`  digest  ${a.digest.slice(0, 16)}`);
+      out(`  권한    ${a.permissions.granted.join(', ') || '없음'}`);
+      out(`  사유    ${a.reason}`);
+    }
+    return EXIT_OK;
+  }
+
+  // 요청을 모은다 — 마감 블록 파일 또는 명령줄.
+  const requests: HireRequest[] = [];
+  const fromFile = flagValue(argv, '--from-meeting');
+  if (fromFile) {
+    try {
+      requests.push(...parseCloseBlock(readFileSync(fromFile, 'utf8')).hires);
+    } catch (err) {
+      process.stderr.write(`마감 블록을 읽지 못했습니다: ${(err as Error).message}\n`);
+      return EXIT_CANNOT_RUN;
+    }
+  }
+  const target = flagValue(argv, '--borrow') ?? flagValue(argv, '--build');
+  if (target) {
+    requests.push({
+      mode: flagValue(argv, '--borrow') ? 'borrow' : 'build',
+      target,
+      reason: flagValue(argv, '--reason') ?? '사유 없음',
+    });
+  }
+
+  if (requests.length === 0) {
+    process.stderr.write(
+      '사용법: company hire --from-meeting <마감블록.txt>\n' +
+        '        company hire --borrow <패키지> --reason "<사유>"\n' +
+        '        company hire list\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  const ledger = Ledger.open(ledgerPath(argv));
+  const { policy } = loadPolicy(policyFile(argv));
+  const { svc } = approvalService(argv);
+
+  // 정원은 검증된 좌석의 동시성 합이다. 실측되지 않은 좌석은 세지 않는다.
+  const capacity = ALL_SEATS.filter((sp) => sp.verified).reduce(
+    (n, sp) => n + effectiveConcurrency(sp),
+    0,
+  );
+  const occupied = readBorrowed(lockText).length + ALL_PERSONAS.length;
+
+  const broker = new HireBroker({
+    ledger,
+    approvals: svc,
+    policy,
+    lockFile,
+    budget: { capacity: Math.max(capacity, occupied + 1), occupied },
+    // Hub 차용은 desktop 이 한다. 여기서는 확보 경로가 없다는 사실을 그대로 알린다.
+    acquire: async () => ({
+      ok: false as const,
+      reason:
+        'Hub 차용 경로가 이 프로세스에 없다 — desktop 이 확보하고 company 는 판정·기록한다 ' +
+        '(Task 16.0 게이트 훅 참조)',
+    }),
+  });
+
+  let worst = EXIT_OK;
+  for (const req of requests) {
+    const result = await broker.hire(req, lockText);
+    if (hasFlag(argv, '--json')) {
+      jsonOut(result);
+    } else {
+      out(`채용  ${req.mode} ${req.target}`);
+      if (result.ok) {
+        out(`  완료 — 권한 [${result.agent?.permissions.granted.join(', ') || '없음'}]`);
+      } else {
+        out(`  거부 — ${result.reason}: ${result.detail}`);
+        for (const line of result.proposal ?? []) out(`  ${line}`);
+        if (result.approvalId) {
+          out(`  승인: company approvals approve ${result.approvalId} --digest ${hireDigest(req)}`);
+        }
+      }
+    }
+    if (!result.ok) worst = EXIT_FINDING;
+  }
+  return worst;
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
   const sub = subcommand(argv);
@@ -1282,6 +1401,10 @@ function usage(): void {
   out('  company publish --verb <동사.json> [--key <멱등키>] [--dry-run] [--brand-ok]');
   out('      동사는 파일로만 받습니다. 자유 텍스트를 받는 인자는 없습니다');
   out('');
+  out('  채용 (R13) — 회의가 결정하고 오너가 L3 로 승인한다');
+  out('  company hire --from-meeting <마감블록.txt> | --borrow <패키지> --reason "<사유>"');
+  out('  company hire list                차용된 에이전트와 권한');
+  out('');
   out('  구역·비밀 (R15) — 좌석은 브로커 자산을 보지 못한다');
   out('  company security verify          권한 표와 실제 권한을 대조');
   out('  company security lint <파일>     비밀·PII 검출 (값은 출력하지 않음)');
@@ -1326,6 +1449,8 @@ async function main(): Promise<number> {
         return cmdSecurity(argv);
       case 'studio':
         return await cmdStudio(argv);
+      case 'hire':
+        return await cmdHire(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':
