@@ -28,6 +28,8 @@ export type EventKind =
   | 'gate.verdict'
   | 'approval'
   | 'switch.change'
+  /** 오피스 기기 등록·폐기 (R14.3, R14.4). 접속권의 변경은 별도 감사 대상이다. */
+  | 'device.change'
   | 'hands.step'
   | 'publish'
   | 'deny'

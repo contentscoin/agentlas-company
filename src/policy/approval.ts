@@ -61,6 +61,21 @@ export class ApprovalService {
     this.load();
   }
 
+  /**
+   * 디스크 상태를 다시 읽는다.
+   *
+   * 생성자에서 한 번만 읽던 것을 매 조회마다 읽도록 바꿨다. CLI 는 명령마다
+   * 새 프로세스라 문제가 드러나지 않았지만, 오피스 API 서버는 장수 프로세스다 —
+   * 기동 이후 다른 프로세스가 만든 승인 카드를 영영 보지 못했다. 폰에 대기
+   * 승인이 안 뜨는 형태로 Task 14 실측에서 잡혔다.
+   *
+   * 병합이라 메모리에만 있는 항목은 남는다. 모든 변경이 즉시 save() 하므로
+   * 디스크가 정본이고, 승인은 삭제되지 않고 상태만 바뀌므로 병합으로 충분하다.
+   */
+  refresh(): void {
+    this.load();
+  }
+
   private load(): void {
     if (!this.file || !existsSync(this.file)) return;
     try {
@@ -131,11 +146,13 @@ export class ApprovalService {
   }
 
   get(id: string): ApprovalRequest | undefined {
+    this.load();
     this.sweep();
     return this.requests.get(id);
   }
 
   pending(): ApprovalRequest[] {
+    this.load();
     this.sweep();
     return [...this.requests.values()].filter((r) => r.status === 'pending');
   }
@@ -154,6 +171,7 @@ export class ApprovalService {
    * 매번 오너 승인을 다시 받아야 하는 것이고, 모든 시도가 원장에 남는다.
    */
   findOpen(action: string, payloadDigest: string): ApprovalRequest | undefined {
+    this.load();
     this.sweep();
     return [...this.requests.values()].find(
       (r) =>
@@ -171,6 +189,7 @@ export class ApprovalService {
    * 인증 성공 여부와 무관하게 기록해야 할 사건이기 때문이다.
    */
   approve(id: string, by: Submitter, payloadDigest: string): ApprovalOutcome {
+    this.load();
     this.sweep();
     const request = this.requests.get(id);
     if (!request) return { ok: false, request: missing(id), reason: '없는 승인 요청' };
@@ -232,6 +251,7 @@ export class ApprovalService {
   }
 
   reject(id: string, by: Submitter, reason = '오너 거부'): ApprovalOutcome {
+    this.load();
     this.sweep();
     const request = this.requests.get(id);
     if (!request) return { ok: false, request: missing(id), reason: '없는 승인 요청' };
@@ -291,6 +311,7 @@ export class ApprovalService {
    * 남기면 "개별 실행마다 승인" (R8.6) 이 무의미해진다.
    */
   consume(id: string, payloadDigest: string): ConsumeOutcome {
+    this.load();
     this.sweep();
     const request = this.requests.get(id);
     if (!request) return { allowed: false, reason: 'not-found' };

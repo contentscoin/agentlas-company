@@ -28,6 +28,10 @@ import { resolveGate } from './policy/gate.js';
 import { parseHandsPlan } from './hands/parse.js';
 import { DEFAULT_HANDS_POLICY } from './hands/types.js';
 import { HandsExecutor, planDigest } from './hands/executor.js';
+import { OfficeServer } from './office/server.js';
+import { DeviceStore } from './office/tokens.js';
+import { RefuseAllStepUp, TotpStepUp } from './office/stepup.js';
+import { PublicBindRefused } from './office/bind.js';
 import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
 import { randomUUID } from 'node:crypto';
@@ -732,6 +736,134 @@ async function cmdHands(argv: string[]): Promise<number> {
   return result.ok ? EXIT_OK : EXIT_FINDING;
 }
 
+function officeDeps(argv: string[]): {
+  ledger: Ledger;
+  devices: DeviceStore;
+  totp: TotpStepUp;
+} {
+  const ledger = Ledger.open(ledgerPath(argv));
+  const devices = new DeviceStore({ file: join(resolveState(), 'office', 'devices.json'), ledger });
+  const totp = new TotpStepUp({ file: join(resolveState(), 'office', 'stepup.json') });
+  return { ledger, devices, totp };
+}
+
+/**
+ * 오피스 API (R10, R14).
+ *
+ * 하위 명령: (없음)=기동, `device add|list|revoke`, `enroll`
+ */
+async function cmdOffice(argv: string[]): Promise<number> {
+  const sub = subcommand(argv);
+  const { ledger, devices, totp } = officeDeps(argv);
+
+  if (sub === 'device') {
+    const op = argv[2];
+    if (op === 'add') {
+      const label = flagValue(argv, '--label') ?? '이름 없는 기기';
+      const kind = flagValue(argv, '--kind') === 'desktop' ? 'desktop' : 'mobile';
+      const issued = devices.issue(label, kind);
+      if (hasFlag(argv, '--json')) jsonOut({ device: issued.record, token: issued.token });
+      else {
+        out(`기기 등록 — ${issued.record.label} (${issued.record.id})`);
+        out('');
+        out(`  토큰: ${issued.token}`);
+        out('');
+        out('  이 토큰은 지금 한 번만 보입니다. 저장되는 것은 해시뿐입니다.');
+      }
+      return EXIT_OK;
+    }
+    if (op === 'revoke') {
+      const id = argv[3];
+      if (!id) {
+        process.stderr.write('사용법: company office device revoke <기기ID>\n');
+        return EXIT_CANNOT_RUN;
+      }
+      const ok = devices.revoke(id);
+      out(ok ? `폐기 완료 — ${id}` : `폐기할 기기가 없습니다 — ${id}`);
+      return ok ? EXIT_OK : EXIT_FINDING;
+    }
+    const list = devices.list();
+    if (hasFlag(argv, '--json')) {
+      jsonOut({ devices: list });
+      return EXIT_OK;
+    }
+    if (list.length === 0) {
+      out('등록된 기기 없음');
+      return EXIT_OK;
+    }
+    for (const d of list) {
+      const state = d.revokedAt ? `폐기 ${d.revokedAt}` : '활성';
+      out(`${d.id}  ${d.kind.padEnd(8)} ${d.label.padEnd(16)} ${state}`);
+    }
+    return EXIT_OK;
+  }
+
+  if (sub === 'enroll') {
+    const id = argv[2];
+    if (!id) {
+      process.stderr.write('사용법: company office enroll <기기ID>\n');
+      return EXIT_CANNOT_RUN;
+    }
+    if (!devices.list().some((d) => d.id === id)) {
+      process.stderr.write(`등록되지 않은 기기입니다: ${id}\n`);
+      return EXIT_CANNOT_RUN;
+    }
+    const { secret, uri } = totp.enroll(id);
+    if (hasFlag(argv, '--json')) jsonOut({ deviceId: id, secret, uri });
+    else {
+      out(`단계별 인증 등록 — ${id}`);
+      out('');
+      out(`  시크릿: ${secret}`);
+      out(`  URI:    ${uri}`);
+      out('');
+      out('  인증 앱에 넣으세요. L3 승인과 능력 스위치 변경에 이 코드가 필요합니다.');
+    }
+    return EXIT_OK;
+  }
+
+  // 기동
+  const host = flagValue(argv, '--host') ?? '127.0.0.1';
+  const port = Number(flagValue(argv, '--port') ?? '0');
+  const { policy } = loadPolicy(policyFile(argv));
+  const { svc } = approvalService(argv);
+  const enrolledAny = devices.list().some((d) => !d.revokedAt && totp.enrolled(d.id));
+
+  const server = new OfficeServer({
+    ledger,
+    approvals: svc,
+    capabilities: capStore(argv),
+    devices,
+    // 등록된 기기가 하나도 없으면 전부 거부하는 검증기를 쓴다. 자리표시자가
+    // 통과시키던 자리를 거부가 대신한다 (Task 8.1).
+    stepUp: enrolledAny ? totp : new RefuseAllStepUp(),
+    host,
+    port,
+  });
+
+  try {
+    const bound = await server.listen();
+    out(`오피스 API — http://${bound.host}:${bound.port}`);
+    out(`  기기 ${devices.list().filter((d) => !d.revokedAt).length}대 활성`);
+    out(`  단계별 인증 ${enrolledAny ? '등록됨' : '미등록 — L3 승인은 거부됩니다'}`);
+    out(`  정책 ${policy.ownerIdentities.join(', ')}`);
+    out('  Ctrl-C 로 종료');
+    await new Promise<void>((resolve) => {
+      process.on('SIGINT', resolve);
+      process.on('SIGTERM', resolve);
+    });
+    server.close();
+    return EXIT_OK;
+  } catch (err) {
+    if (err instanceof PublicBindRefused) {
+      process.stderr.write(`${err.message}\n`);
+      process.stderr.write('  loopback 또는 사설망 주소로만 기동합니다 (R14.1, R14.2)\n');
+      return EXIT_CANNOT_RUN;
+    }
+    process.stderr.write(`기동 실패: ${(err as Error).message}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+}
+
 /** 승인 대기 목록과 결정 (R4). */
 function cmdApprovals(argv: string[]): number {
   const sub = subcommand(argv);
@@ -835,6 +967,12 @@ function usage(): void {
   out('  company hands --plan <계획.json> --domains blog.naver.com [--tainted]');
   out('      계획은 파일로만 받습니다. 자연어 지시를 받는 인자는 없습니다');
   out('');
+  out('  오피스 API (R10, R14) — 데스크톱·모바일이 같은 API 를 본다');
+  out('  company office [--host 127.0.0.1] [--port 0]   기동 (공개 인터페이스 거부)');
+  out('  company office device add --label "내 폰"       기기 토큰 발급');
+  out('  company office device list | revoke <ID>');
+  out('  company office enroll <기기ID>                  단계별 인증(TOTP) 등록');
+  out('');
   out('  회의 (R3) — 2라운드 턴제, Critic 은 다른 벤더 좌석');
   out('  company meeting --agenda "안건" [--attendees cto,growth] [--companyctl <경로>]');
   out('');
@@ -867,6 +1005,8 @@ async function main(): Promise<number> {
         return cmdGate(argv);
       case 'hands':
         return await cmdHands(argv);
+      case 'office':
+        return await cmdOffice(argv);
       case 'approvals':
         return cmdApprovals(argv);
       case 'run':

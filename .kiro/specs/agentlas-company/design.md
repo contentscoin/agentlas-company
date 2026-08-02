@@ -85,7 +85,7 @@ flowchart TB
 | desktop 표면 | 프로토콜 | 플랫폼 | company 쪽 소비자 |
 |---|---|---|---|
 | `mcp-tools/browser-cdp-launcher.ts` | MCP stdio (`@playwright/mcp` 프록시) | 전부 | **Hands Executor (Task 10)** |
-| `mobile-bridge/server.ts` | HTTPS/WSS + 페어링 + authority | 전부 | 오피스 API·모바일 승인 (Task 14) |
+| `mobile-bridge/server.ts` | HTTPS/WSS + 페어링 + authority | 전부 | **없음** — 아래 참조 |
 | `browser/approval-server.ts` | loopback HTTP | 전부 | 런처가 직접 호출 (민감 행동 승인) |
 | `mcp-tools/registry.ts` | 외부 MCP 등록 (stdio/sse/http) | 전부 | company 를 도구로 등록 (Task 16) |
 | `computer-use/control-server.ts` | loopback HTTP + Bearer | **macOS 전용** | 없음 — 아래 참조 |
@@ -95,6 +95,12 @@ flowchart TB
 Hands 가 실제로 붙는 곳은 desktop 이 `~/.agentlas/agentlas-browser-cdp.mjs` 로 물질화하는 CDP 런처입니다. 의존성 0 의 순수 node 스크립트이고, 전용 Chrome 프로필(`~/.agentlas/chrome-cdp-profile`)을 원격 디버깅 포트로 띄운 뒤 `@playwright/mcp` 를 CDP 로 붙입니다. 로그인 세션이 유지된 전용 프로필이라는 점이 R7.1 그 자체이고, 신선한 임시 프로필이 봇 차단에 걸리는 문제를 desktop 이 이미 풀어 놓았습니다.
 
 **조작 하나에 게이트가 둘입니다.** company 의 승인 게이트를 통과해도, 런처가 결제·게시·삭제·임의코드를 감지하면 desktop 승인 UI 로 다시 막습니다. 런처는 현재 페이지 URL 을 CDP 로 확인할 수 없으면 민감 행동을 진행하지 않습니다(fail-closed). 우리 게이트를 지나 desktop 게이트에서 멈추는 것은 정상 동작이며, 실행기는 그것을 `step-failed` 로 보고하고 체크리스트를 냅니다.
+
+**mobile-bridge 는 붙일 수 없습니다.** 크로스플랫폼이고 밖으로 나와 있지만, `projector.ts` 가 desktop 내부 스토어(`../store/firms`, `../store/projects`, `../confirm`, `../secrets/vault`, `../usage`, `../one/*`)를 직접 import 해 **자기 상태만** 투영합니다. 외부 시스템을 끼울 확장점·피드·설정이 없습니다. 브리지는 desktop 이 아는 것을 폰에 보여주는 닫힌 투영이고, company 의 원장·승인·능력 스위치는 desktop 이 모릅니다. Task 10 의 computer-use 가 **플랫폼** 문제였다면 이쪽은 **결합도** 문제이며, 어느 쪽도 company 코드로는 풀리지 않습니다.
+
+그래서 오피스 API 는 company 가 전부 소유합니다(`src/office/`). 모바일 표면을 어떻게 낼지는 열려 있습니다 — company 가 PWA 를 직접 내거나, desktop 에 확장점 PR 을 올리거나, company 를 MCP 도구로 등록(Task 16)하는 셋 중 하나입니다.
+
+단계별 인증은 TOTP(RFC 6238)입니다. 설계 초안은 desktop 페어링 기기를 두 번째 요소로 쓰려 했으나 위 결합도 문제로 불가능합니다. TOTP 는 소유 요소(폰)를 검증하면서 company 밖에 의존하지 않고, 기본 검증기가 **전부 거부**라 등록하지 않은 채로 L3 이 열리지 않습니다.
 
 Hands 가 노출하는 동사는 8종뿐입니다. `@playwright/mcp` 의 도구는 훨씬 많지만 전부 열지 않습니다 — `browser_evaluate`(임의 JS 실행은 자유 텍스트가 실행이 되는 바로 그 경로), `browser_cookie_*`·`browser_localstorage_*`(자격증명 표면은 좌석 구역이 읽을 것이 아닙니다, R15), `browser_mouse_*_xy`(좌표 조작은 화면이 바뀌면 조용히 엉뚱한 곳을 누릅니다). 제외 목록과 이유는 `src/hands/types.ts` 주석에 고정해 두었습니다.
 
