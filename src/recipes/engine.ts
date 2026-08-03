@@ -180,6 +180,7 @@ export class RecipeEngine {
       kind: 'decision',
       runId,
       summary: `${recipe.name} 실행 시작 — 스텝 ${recipe.steps.length}개`,
+      runPhase: 'start',
     });
 
     try {
@@ -211,6 +212,7 @@ export class RecipeEngine {
       kind: 'decision',
       runId,
       summary: `${recipe.name} 재개`,
+      runPhase: 'resume',
     });
 
     try {
@@ -244,6 +246,7 @@ export class RecipeEngine {
           kind: 'decision',
           runId: state.runId,
           summary: `${recipe.name} 일시정지 — ${step.id} 승인 대기`,
+          runPhase: 'pause',
         });
         return { runId: state.runId, status: 'paused', stoppedAt: step.id, reason: '승인 대기' };
       }
@@ -258,6 +261,7 @@ export class RecipeEngine {
           kind: 'gate.verdict',
           runId: state.runId,
           summary: `${recipe.name} 중단 — ${step.id}: ${st.detail ?? '실패'}`,
+          runPhase: 'end',
         });
         return {
           runId: state.runId,
@@ -276,6 +280,7 @@ export class RecipeEngine {
       kind: 'decision',
       runId: state.runId,
       summary: `${recipe.name} 완료`,
+      runPhase: 'end',
     });
     return { runId: state.runId, status: 'completed' };
   }

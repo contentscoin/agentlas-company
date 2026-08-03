@@ -237,7 +237,17 @@ export class OfficeServer {
     });
   }
 
-  /** 진행 중인 실행 — 주체·좌석·작업명·경과·증거 건수 (R10.2). */
+  /**
+   * 진행 중인 실행 — 주체·좌석·작업명·경과·증거 건수 (R10.2).
+   *
+   * **수명주기 표시를 쓴다.** 예전에는 마지막 이벤트의 `kind` 로 판정했는데,
+   * 시작·일시정지·완료가 전부 `decision` 이라 **막 시작한 실행이 "실행 중
+   * 0건" 으로 보였다** — 콘솔에 이 화면을 붙이고 실제 실행을 돌려서 드러났다.
+   *
+   * `runPhase` 가 없는 옛 이벤트에는 예전 추정을 쓴다. 되돌아간 추정이라는
+   * 사실을 `derived` 로 함께 내보낸다 — 확인하지 못한 것을 확인한 것처럼
+   * 보고하지 않는다.
+   */
   private runningRuns(events: readonly LedgerEvent[]): unknown[] {
     const byRun = new Map<string, LedgerEvent[]>();
     for (const e of events) {
@@ -252,8 +262,18 @@ export class OfficeServer {
       const sorted = [...list].sort((a, b) => a.seq - b.seq);
       const first = sorted[0]!;
       const last = sorted[sorted.length - 1]!;
-      // 종결 이벤트가 있으면 진행 중이 아니다.
-      if (last.kind === 'publish' || last.kind === 'retro' || last.kind === 'decision') continue;
+
+      // 마지막 수명주기 표시가 판정한다.
+      const phases = sorted.filter((e) => e.runPhase !== undefined);
+      const phase = phases[phases.length - 1]?.runPhase;
+      const derived = phase === undefined;
+      if (phase === 'end') continue;
+      if (phase === 'pause') continue;
+      // 표시가 없는 옛 이벤트: 예전 추정으로 되돌아간다.
+      if (derived && (last.kind === 'publish' || last.kind === 'retro' || last.kind === 'decision')) {
+        continue;
+      }
+
       out.push({
         runId,
         actor: first.actor,
@@ -263,6 +283,8 @@ export class OfficeServer {
         elapsedMs: now - Date.parse(first.at),
         evidenceCount: sorted.reduce((n, e) => n + (e.evidence?.length ?? 0), 0),
         tainted: sorted.some((e) => e.tainted === true),
+        // 표시 없이 추정으로 판정했는가. 화면이 그 사실을 감추지 않는다.
+        derived,
       });
     }
     return out;
@@ -291,7 +313,13 @@ export class OfficeServer {
       connection: 'keep-alive',
     });
 
-    const since = Number(url.searchParams.get('since') ?? '0');
+    // 재연결은 `Last-Event-ID` 로 이어붙인다. `id:` 를 써 보내면서 헤더를
+    // 무시하면 프로토콜을 반만 구현한 것이고, 폰이 끊길 때마다 전체를 다시
+    // 받는다 — 콘솔을 붙이고 나서 드러났다. 명시적 `?since=` 가 있으면 그쪽이
+    // 이긴다(테스트와 갭 재현용).
+    const explicit = url.searchParams.get('since');
+    const resumed = req.headers['last-event-id'];
+    const since = Number(explicit ?? (typeof resumed === 'string' ? resumed : '0')) || 0;
     const backlog = this.opts.ledger.query({ limit: 1000 }).filter((e) => e.seq > since);
     for (const event of backlog) this.write(res, event);
 

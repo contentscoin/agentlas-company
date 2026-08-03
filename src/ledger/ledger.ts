@@ -52,6 +52,10 @@ export function canonicalize(event: Omit<LedgerEvent, 'hash'>): string {
     ...(event.level ? { level: event.level } : {}),
     ...(event.tainted !== undefined ? { tainted: event.tainted } : {}),
     ...(event.runId ? { runId: event.runId } : {}),
+    // 해시가 덮어야 한다. 디스크에만 쓰고 정본에서 빼면 실행 상태를 체인을
+    // 깨지 않고 바꿀 수 있다 — 없는 필드는 예전처럼 빠지므로 옛 이벤트의
+    // 해시는 그대로 검증된다.
+    ...(event.runPhase ? { runPhase: event.runPhase } : {}),
     ...(event.payloadDigest ? { payloadDigest: event.payloadDigest } : {}),
     ...(event.summary ? { summary: event.summary } : {}),
     evidence: event.evidence,
@@ -146,6 +150,7 @@ export class Ledger {
       ...(input.level !== undefined ? { level: input.level } : {}),
       ...(input.tainted !== undefined ? { tainted: input.tainted } : {}),
       ...(input.runId !== undefined ? { runId: input.runId } : {}),
+      ...(input.runPhase !== undefined ? { runPhase: input.runPhase } : {}),
       ...(input.payloadDigest !== undefined ? { payloadDigest: input.payloadDigest } : {}),
       ...(input.summary !== undefined ? { summary: input.summary } : {}),
       evidence: input.evidence ?? [],

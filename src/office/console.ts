@@ -16,6 +16,15 @@
  *
  * 빌드 단계를 두지 않는다. 문자열 하나로 서빙하면 오피스 서버만 띄우면 되고,
  * 번들러가 죽어서 승인이 막히는 경로가 생기지 않는다.
+ *
+ * ## 관측 화면 (R10.1~R10.3)
+ *
+ * 승인 다음으로 원장 타임라인과 실행 상태를 붙였다. 둘 다 **합성하지
+ * 않는다** — 원장에 있는 것만 그리고, 진행률처럼 우리가 모르는 값은 만들지
+ * 않는다. 실행이 몇 퍼센트 남았는지 아는 방법이 없으므로 막대를 그리지
+ * 않고 경과 시간과 증거 건수만 보여 준다.
+ *
+ * 원장에는 본문이 없고 digest 만 있다 (R9). 화면도 그 사실을 감추지 않는다.
  */
 
 export const CONSOLE_HTML = `<!doctype html>
@@ -146,6 +155,44 @@ export const CONSOLE_HTML = `<!doctype html>
   #lock h2 { font-size: 1.15rem; margin: 0 0 .4rem; }
   #lock p { color: var(--muted); font-size: .88rem; margin: 0 0 1.2rem; }
   .hidden { display: none !important; }
+
+  .tabs { display: flex; gap: .35rem; margin-bottom: 1rem; }
+  .tab {
+    flex: 1; padding: .55rem .4rem; font-size: .88rem;
+    background: transparent; border: 1px solid var(--line);
+    color: var(--muted); min-height: 40px;
+  }
+  .tab.on { background: var(--panel); color: var(--ink); border-color: #2f4a44; }
+  .badge {
+    display: inline-block; min-width: 1.2em; padding: 0 .3em;
+    border-radius: 999px; background: #2f4a44; color: var(--accent);
+    font-size: .72rem; margin-left: .2rem;
+  }
+  .badge:empty { display: none; }
+
+  .run { border-left: 3px solid var(--accent); }
+  .run .id { font-size: .72rem; color: var(--muted); }
+  .kv { display: flex; gap: 1rem; margin-top: .5rem; flex-wrap: wrap; }
+  .kv div { font-size: .8rem; color: var(--muted); }
+  .kv b { display: block; color: var(--ink); font-weight: 600; font-size: .95rem; }
+
+  .ev {
+    display: grid; grid-template-columns: auto 1fr; gap: .6rem;
+    padding: .55rem 0; border-bottom: 1px solid var(--line);
+    font-size: .85rem;
+  }
+  .ev:last-child { border-bottom: 0; }
+  .ev .when { color: var(--muted); font-size: .74rem; padding-top: .15rem; white-space: nowrap; }
+  .ev .kind {
+    display: inline-block; font-size: .68rem; font-weight: 700;
+    padding: .1rem .35rem; border-radius: 3px; margin-right: .4rem;
+    background: #24333a; color: var(--muted); vertical-align: .05em;
+  }
+  .ev .kind.deny { background: #3a2724; color: var(--danger); }
+  .ev .kind.approval { background: #1d4d41; color: #a7ddcb; }
+  .ev .kind.publish { background: #24333a; color: var(--accent); }
+  .ev .kind.tainted { background: #3a3324; color: var(--warn); }
+  .ev .who { color: var(--muted); font-size: .74rem; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
@@ -163,11 +210,20 @@ export const CONSOLE_HTML = `<!doctype html>
   <div id="app" class="hidden">
     <header>
       <span class="dot" id="dot"></span>
-      <h1>승인</h1>
+      <h1 id="title">승인</h1>
       <span class="meta" id="meta">—</span>
     </header>
+
+    <nav class="tabs" role="tablist">
+      <button role="tab" class="tab on" data-view="approvals">승인 <span class="badge" id="b-appr"></span></button>
+      <button role="tab" class="tab" data-view="runs">실행 <span class="badge" id="b-runs"></span></button>
+      <button role="tab" class="tab" data-view="ledger">원장</button>
+    </nav>
+
     <div id="msg"></div>
     <div id="list"></div>
+    <div id="runs" class="hidden"></div>
+    <div id="ledger" class="hidden"></div>
     <div class="foot">
       <button class="panic" id="panic">전체 차단 — 모든 능력 스위치를 끕니다</button>
       <p>승인은 화면에 보이는 내용에 묶입니다. 목록이 바뀐 뒤에 누르면 그 승인은 거부됩니다.</p>
@@ -184,6 +240,11 @@ export const CONSOLE_HTML = `<!doctype html>
   var token = null;
   var es = null;
   var cards = [];
+  var runs = [];
+  var events = [];      // 최신 우선
+  var lastSeq = 0;
+  var view = 'approvals';
+  var MAX_EVENTS = 300; // 폰에서 무한히 쌓지 않는다
 
   // 주소창 조각(#token=…)으로 한 번에 넣을 수 있게 한다. 조각은 서버로
   // 전송되지 않으므로 토큰이 접근 로그에 남지 않는다.
@@ -263,12 +324,138 @@ export const CONSOLE_HTML = `<!doctype html>
     }).join('');
   }
 
+  function fmtElapsed(ms) {
+    if (!isFinite(ms) || ms < 0) return '—';
+    var s = Math.floor(ms / 1000);
+    if (s < 60) return s + '초';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + '분';
+    return Math.floor(m / 60) + '시간 ' + (m % 60) + '분';
+  }
+
+  function clock(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  function renderRuns() {
+    var el = $('runs');
+    if (!runs.length) {
+      el.innerHTML =
+        '<div class="empty"><div class="big">진행 중인 실행이 없습니다</div>' +
+        '<div>원장에 시작 기록이 있고 끝 기록이 없는 실행만 여기 나옵니다.</div></div>';
+      return;
+    }
+    el.innerHTML = runs.map(function (r) {
+      return (
+        '<div class="card run">' +
+          '<div class="row">' +
+            '<span class="action">' + esc(r.task || '(작업명 없음)') + '</span>' +
+            (r.tainted ? '<span class="tag">오염</span>' : '') +
+          '</div>' +
+          '<p class="id mono">' + esc(r.runId) + '</p>' +
+          '<div class="kv">' +
+            '<div>경과<b>' + esc(fmtElapsed(r.elapsedMs)) + '</b></div>' +
+            '<div>증거<b>' + esc(String(r.evidenceCount)) + '건</b></div>' +
+            '<div>주체<b>' + esc(r.seat || (r.actor && r.actor.id) || '—') + '</b></div>' +
+          '</div>' +
+        '</div>'
+      );
+    }).join('') +
+    '<p class="sub">진행률은 표시하지 않습니다 — 남은 분량을 아는 방법이 없습니다.</p>';
+  }
+
+  function renderLedger() {
+    var el = $('ledger');
+    if (!events.length) {
+      el.innerHTML = '<div class="empty"><div class="big">기록이 없습니다</div></div>';
+      return;
+    }
+    el.innerHTML =
+      '<div class="card">' +
+      events.map(function (e) {
+        var k = String(e.kind || '');
+        // deny 만 붉게 칠한다. gate.verdict 는 PASS 도 FAIL 도 내므로
+        // 종류만 보고 색을 정하면 통과를 실패로 읽게 된다 — 실제로 그렇게 보였다.
+        var cls = k.indexOf('deny') === 0 ? 'deny'
+          : k.indexOf('approval') === 0 ? 'approval'
+          : k.indexOf('publish') === 0 ? 'publish' : '';
+        return (
+          '<div class="ev">' +
+            '<span class="when mono">' + esc(clock(e.at)) + '</span>' +
+            '<div>' +
+              '<span class="kind ' + cls + '">' + esc(k) + '</span>' +
+              (e.tainted ? '<span class="kind tainted">오염</span>' : '') +
+              esc(e.summary || '(요약 없음)') +
+              '<div class="who mono">#' + esc(String(e.seq)) + ' · ' +
+                esc((e.actor && e.actor.id) || '?') +
+                (e.level ? ' · ' + esc(e.level) : '') + '</div>' +
+            '</div>' +
+          '</div>'
+        );
+      }).join('') +
+      '</div>' +
+      '<p class="sub">원장에는 본문이 없습니다. 남는 것은 요약과 digest 뿐입니다.</p>';
+  }
+
+  function paint() {
+    $('b-appr').textContent = cards.length ? String(cards.length) : '';
+    $('b-runs').textContent = runs.length ? String(runs.length) : '';
+    var meta = $('meta');
+    if (view === 'approvals') {
+      $('title').textContent = '승인';
+      meta.textContent = cards.length ? cards.length + '건 대기' : '대기 없음';
+      render();
+    } else if (view === 'runs') {
+      $('title').textContent = '실행';
+      meta.textContent = runs.length ? runs.length + '건 진행 중' : '진행 중 없음';
+      renderRuns();
+    } else {
+      $('title').textContent = '원장';
+      meta.textContent = lastSeq ? '#' + lastSeq + ' 까지' : '기록 없음';
+      renderLedger();
+    }
+  }
+
+  function switchTo(next) {
+    view = next;
+    ['approvals', 'runs', 'ledger'].forEach(function (v) {
+      var pane = $(v === 'approvals' ? 'list' : v);
+      pane.classList.toggle('hidden', v !== next);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) {
+      t.classList.toggle('on', t.getAttribute('data-view') === next);
+    });
+    paint();
+  }
+
+  function loadState() {
+    return api('/api/state').then(function (r) {
+      if (r.status !== 200) return;
+      runs = (r.body && r.body.running) || [];
+      paint();
+    });
+  }
+
+  /** SSE 로 받은 이벤트를 앞에 붙인다. seq 로 중복을 막는다. */
+  function absorb(e) {
+    if (!e || typeof e.seq !== 'number') return;
+    if (events.length && events[0].seq >= e.seq) {
+      if (events.some(function (x) { return x.seq === e.seq; })) return;
+    }
+    events.unshift(e);
+    if (e.seq > lastSeq) lastSeq = e.seq;
+    if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+  }
+
   function load() {
     return api('/api/approvals').then(function (r) {
       if (r.status === 401) { lock('토큰이 유효하지 않습니다'); return; }
       cards = (r.body && r.body.pending) || [];
-      $('meta').textContent = cards.length ? cards.length + '건 대기' : '대기 없음';
-      render();
+      paint();
+      return loadState();
     });
   }
 
@@ -308,7 +495,11 @@ export const CONSOLE_HTML = `<!doctype html>
     es = new EventSource('/api/events?token=' + encodeURIComponent(token));
     es.onopen = function () { $('dot').classList.add('live'); };
     es.onerror = function () { $('dot').classList.remove('live'); };
-    es.onmessage = function () { load(); };
+    es.onmessage = function (ev) {
+      try { absorb(JSON.parse(ev.data)); } catch (_) { /* 못 읽은 줄은 버린다 */ }
+      // 원장이 움직였다는 것은 승인·실행도 움직였을 수 있다는 뜻이다.
+      load();
+    };
   }
 
   function unlock(t) {
@@ -347,6 +538,10 @@ export const CONSOLE_HTML = `<!doctype html>
     if (card) decide(card.getAttribute('data-id'), btn.getAttribute('data-act'), btn);
   });
 
+  Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) {
+    t.addEventListener('click', function () { switchTo(t.getAttribute('data-view')); });
+  });
+
   $('unlock').addEventListener('click', function () {
     var v = $('tok').value.trim();
     if (v) unlock(v);
@@ -363,7 +558,7 @@ export const CONSOLE_HTML = `<!doctype html>
   });
 
   // 남은 시간을 1분마다 다시 그린다.
-  setInterval(function () { if (token) render(); }, 60000);
+  setInterval(function () { if (token) paint(); }, 60000);
 
   var t = fromHash() || localStorage.getItem(KEY);
   if (t) unlock(t).then(function (ok) { if (!ok) lock(null); });

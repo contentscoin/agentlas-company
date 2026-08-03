@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Ledger } from '../ledger/ledger.js';
+import { Ledger, hashEvent } from '../ledger/ledger.js';
 import { ApprovalService } from '../policy/approval.js';
 import { CapabilityStore } from '../capabilities/store.js';
 import { DEFAULT_POLICY } from '../policy/policy.js';
@@ -363,5 +363,78 @@ describe('콘솔 껍데기 (R14.4)', () => {
   it('질의 문자열 토큰은 SSE 에서만 통한다', async () => {
     const res = await fetch(`${base}/api/approvals?token=${token}`);
     expect(res.status).toBe(401);
+  });
+});
+
+describe('진행 중인 실행 (R10.2)', () => {
+  /**
+   * 예전에는 마지막 이벤트의 `kind` 로 판정했다. 시작·일시정지·완료가 전부
+   * `decision` 이라 **막 시작한 실행이 "실행 중 0건" 으로 보였다** —
+   * 콘솔에 실행 화면을 붙이고 진짜 레시피를 돌려서 드러났다.
+   */
+  it('막 시작한 실행이 보인다', async () => {
+    ledger.append({
+      actor: { kind: 'system', id: 'recipe-engine' },
+      kind: 'decision',
+      runId: 'run-a',
+      runPhase: 'start',
+      summary: 'demo 실행 시작',
+    });
+    const body = await (await call('/api/state')).json();
+    expect(body.running).toHaveLength(1);
+    expect(body.running[0].runId).toBe('run-a');
+    expect(body.running[0].derived).toBe(false);
+  });
+
+  it('끝난 실행은 빠진다', async () => {
+    ledger.append({ actor: { kind: 'system', id: 'r' }, kind: 'decision', runId: 'run-b', runPhase: 'start' });
+    ledger.append({ actor: { kind: 'system', id: 'r' }, kind: 'decision', runId: 'run-b', runPhase: 'end' });
+    const body = await (await call('/api/state')).json();
+    expect(body.running.map((r: { runId: string }) => r.runId)).not.toContain('run-b');
+  });
+
+  it('승인 대기로 멈춘 실행은 진행 중이 아니다', async () => {
+    ledger.append({ actor: { kind: 'system', id: 'r' }, kind: 'decision', runId: 'run-c', runPhase: 'start' });
+    ledger.append({ actor: { kind: 'system', id: 'r' }, kind: 'decision', runId: 'run-c', runPhase: 'pause' });
+    const body = await (await call('/api/state')).json();
+    expect(body.running.map((r: { runId: string }) => r.runId)).not.toContain('run-c');
+  });
+
+  it('재개하면 다시 진행 중이다', async () => {
+    ledger.append({ actor: { kind: 'system', id: 'r' }, kind: 'decision', runId: 'run-d', runPhase: 'start' });
+    ledger.append({ actor: { kind: 'system', id: 'r' }, kind: 'decision', runId: 'run-d', runPhase: 'pause' });
+    ledger.append({ actor: { kind: 'system', id: 'r' }, kind: 'decision', runId: 'run-d', runPhase: 'resume' });
+    const body = await (await call('/api/state')).json();
+    expect(body.running.map((r: { runId: string }) => r.runId)).toContain('run-d');
+  });
+
+  it('표시 없는 옛 이벤트는 추정으로 판정하고 그 사실을 밝힌다', async () => {
+    ledger.append({
+      actor: { kind: 'system', id: 'seat' },
+      kind: 'seat.call',
+      runId: 'run-old',
+      summary: '좌석 호출',
+    });
+    const body = await (await call('/api/state')).json();
+    const row = body.running.find((r: { runId: string }) => r.runId === 'run-old');
+    expect(row).toBeTruthy();
+    expect(row.derived).toBe(true);
+  });
+});
+
+describe('원장 수명주기 표시는 해시가 덮는다', () => {
+  /**
+   * 디스크에만 쓰고 정본에서 빼면 실행 상태를 체인을 깨지 않고 바꿀 수 있다.
+   */
+  it('runPhase 를 바꾸면 체인이 깨진다', () => {
+    const e = ledger.append({
+      actor: { kind: 'system', id: 'r' },
+      kind: 'decision',
+      runId: 'run-h',
+      runPhase: 'end',
+    });
+    expect(e.runPhase).toBe('end');
+    const tampered = { ...e, runPhase: 'start' as const };
+    expect(hashEvent(tampered)).not.toBe(e.hash);
   });
 });

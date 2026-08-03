@@ -51,6 +51,8 @@ export interface EventInput {
   tainted?: boolean;
   /** 같은 실행에 속한 이벤트를 묶는 키. 리플레이 단위 (R9.5). */
   runId?: string;
+  /** 실행 수명주기 표시 (R10.2). `LedgerEvent.runPhase` 주석 참조. */
+  runPhase?: RunPhase;
   /** 본문은 원장 밖에 두고 여기에는 digest 만 남긴다. */
   payloadDigest?: string;
   /** 사람이 읽는 한 줄 요약. 비밀이나 PII 를 담지 않는다. */
@@ -71,10 +73,25 @@ export interface LedgerEvent {
   level?: AutonomyLevel;
   tainted?: boolean;
   runId?: string;
+  /**
+   * 실행 수명주기 표시 (R10.2).
+   *
+   * 시작·일시정지·재개·종료가 전부 `decision` 한 종류로 기록돼 진행 중인
+   * 실행을 판별할 수 없었다 — 콘솔에 실행 상태를 붙이고 나서, 돌고 있는
+   * 실행이 "실행 중 0건" 으로 보여서 드러났다. 요약 문구로 구분하는 것은
+   * 문구를 고치는 순간 깨지므로 필드로 둔다.
+   *
+   * 선택 필드다. 이 표시가 붙기 전의 이벤트에는 없고, 그때는 읽는 쪽이
+   * 예전 추정으로 되돌아간다.
+   */
+  runPhase?: RunPhase;
   payloadDigest?: string;
   summary?: string;
   evidence: string[];
 }
+
+/** 실행 수명주기. `start` 와 `end` 사이가 진행 중이다. */
+export type RunPhase = 'start' | 'pause' | 'resume' | 'end';
 
 export interface QueryFilter {
   since?: string;
