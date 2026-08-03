@@ -28,7 +28,25 @@ import type { ApprovalService } from '../policy/approval.js';
 import { classify } from '../policy/policy.js';
 import type { PolicyConfig } from '../policy/types.js';
 import { RunLock } from './lock.js';
-import type { Recipe, RunOutcome, RunState, Step, StepState } from './types.js';
+import type {
+  ArtifactJudgment,
+  Recipe,
+  RetroStep,
+  RunOutcome,
+  RunState,
+  Step,
+  StepState,
+} from './types.js';
+import type { PublishBroker } from '../publish/broker.js';
+import { isChannel } from '../verbs/types.js';
+import { compare, noPrediction } from '../assurance/retro.js';
+import type { Observed } from '../assurance/retro.js';
+import type { MetricsBroker } from '../metrics/broker.js';
+import { Studio } from '../studio/studio.js';
+import { SLOT_KINDS, type Slot, type SlotKind } from '../studio/artifact.js';
+import type { BrandPack } from '../studio/brandpack.js';
+import { extractCitations, registerClaims } from '../assurance/claims.js';
+import { assure, describeFinding as describeAssuranceFinding } from '../assurance/checks.js';
 
 export interface EngineOptions {
   ledger: Ledger;
@@ -39,12 +57,50 @@ export interface EngineOptions {
   stateDir: string;
   /** 게이트 명령 타임아웃. */
   gateTimeoutMs?: number;
+  /**
+   * 발행기. 없으면 `publish` 스텝이 실패한다.
+   *
+   * 선택으로 둔 이유는 레시피 대부분이 발행 없이 돌고, 그때 발행 어댑터
+   * 설정을 강요할 이유가 없기 때문이다. 다만 **없는 것을 통과로 처리하지는
+   * 않는다** — 발행 스텝이 있는데 발행기가 없으면 그 자리에서 멈춘다.
+   */
+  publisher?: PublishBroker;
+  /**
+   * 지표 브로커. 없으면 복기가 실측 없이 돈다.
+   *
+   * 없는 것을 실패로 만들지 않는 이유는, 실측 없는 복기도 "측정을 먼저
+   * 고치라" 는 제안을 내기 때문이다 — 그것이 지금 가장 쓸모 있는 산출이다.
+   */
+  metrics?: MetricsBroker;
+  /**
+   * 브랜드 팩 로더. 기본은 파일에서 읽는다.
+   *
+   * 테스트가 파일 없이 팩을 물릴 수 있게 열어 둔다. 읽지 못하면 **빈 팩으로
+   * 조용히 넘어가지 않는다** — 규칙 파일을 못 읽은 것과 규칙이 없는 것은
+   * 다른 사실이고, 전자는 오탈자일 가능성이 크다.
+   */
+  loadBrandPack?: (file: string) => BrandPack;
 }
+
+/** 규칙 없이 대조했는지까지 함께 돌려준다. */
+interface LoadedPack {
+  pack: BrandPack;
+  packless: boolean;
+}
+
+const EMPTY_PACK: BrandPack = {
+  masterSheet: { forbidden: [], required: [] },
+  characters: [],
+  contentBase: { claims: [] },
+};
 
 export class RecipeEngine {
   private readonly ledger: Ledger;
   private readonly broker: SeatBroker;
   private readonly approvals: ApprovalService;
+  private readonly publisher: PublishBroker | undefined;
+  private readonly metrics: MetricsBroker | undefined;
+  private readonly readPack: (file: string) => BrandPack;
   private readonly policy: PolicyConfig;
   private readonly stateDir: string;
   private readonly gateTimeoutMs: number;
@@ -56,6 +112,10 @@ export class RecipeEngine {
     this.policy = opts.policy;
     this.stateDir = opts.stateDir;
     this.gateTimeoutMs = opts.gateTimeoutMs ?? 120_000;
+    this.publisher = opts.publisher;
+    this.metrics = opts.metrics;
+    this.readPack =
+      opts.loadBrandPack ?? ((file) => JSON.parse(readFileSync(file, 'utf8')) as BrandPack);
     mkdirSync(join(this.stateDir, 'runs'), { recursive: true });
   }
 
@@ -120,6 +180,7 @@ export class RecipeEngine {
       kind: 'decision',
       runId,
       summary: `${recipe.name} 실행 시작 — 스텝 ${recipe.steps.length}개`,
+      runPhase: 'start',
     });
 
     try {
@@ -151,6 +212,7 @@ export class RecipeEngine {
       kind: 'decision',
       runId,
       summary: `${recipe.name} 재개`,
+      runPhase: 'resume',
     });
 
     try {
@@ -184,6 +246,7 @@ export class RecipeEngine {
           kind: 'decision',
           runId: state.runId,
           summary: `${recipe.name} 일시정지 — ${step.id} 승인 대기`,
+          runPhase: 'pause',
         });
         return { runId: state.runId, status: 'paused', stoppedAt: step.id, reason: '승인 대기' };
       }
@@ -198,6 +261,7 @@ export class RecipeEngine {
           kind: 'gate.verdict',
           runId: state.runId,
           summary: `${recipe.name} 중단 — ${step.id}: ${st.detail ?? '실패'}`,
+          runPhase: 'end',
         });
         return {
           runId: state.runId,
@@ -216,6 +280,7 @@ export class RecipeEngine {
       kind: 'decision',
       runId: state.runId,
       summary: `${recipe.name} 완료`,
+      runPhase: 'end',
     });
     return { runId: state.runId, status: 'completed' };
   }
@@ -322,15 +387,279 @@ export class RecipeEngine {
         return 'pause';
       }
 
-      case 'publish':
+      case 'publish': {
+        if (!this.publisher) {
+          // 발행기를 물리지 않은 엔진으로 발행 스텝을 돌리려 했다.
+          // 통과로 처리하지 않는다 — 조용한 성공을 만들지 않는다.
+          st.status = 'failed';
+          st.detail = '발행기가 연결되지 않은 엔진이다 (PublishBroker 미주입)';
+          return 'stop';
+        }
+
+        // 본문은 이전 스텝 산출물에서 온다. 레시피에 본문을 직접 적는
+        // 경로를 만들지 않는다 — 그러면 레시피가 자유 텍스트 발행 통로가 된다.
+        const body = state.artifacts[step.subject];
+        if (body === undefined) {
+          st.status = 'failed';
+          st.detail = `산출물 "${step.subject}" 이 없다 — 앞 스텝이 만들지 않았다`;
+          return 'stop';
+        }
+
+        if (!isChannel(step.channel)) {
+          st.status = 'failed';
+          st.detail = `알 수 없는 채널: ${step.channel}`;
+          return 'stop';
+        }
+
+        // 산출물에 판정이 붙어 있으면 그것을 쓴다. 레시피의 `brandOk` 선언은
+        // Studio 를 거치지 않은 산출물에만 쓰인다 — 실제로 대조한 결과를
+        // 선언으로 덮을 수 있다면 대조할 이유가 없다.
+        const judged = state.judgments?.[step.subject];
+        if (judged && step.brandOk && !judged.brandPass) {
+          this.ledger.append({
+            actor: { kind: 'system', id: 'recipe-engine' },
+            kind: 'deny',
+            runId: state.runId,
+            summary:
+              `${step.id}: 레시피의 brandOk 선언을 무시했다 — ` +
+              `${step.subject} 는 실제 대조에서 브랜드 FAIL 이다`,
+          });
+        }
+
+        const result = await this.publisher.publish({
+          channel: step.channel,
+          verb: { op: 'post_text', channel: step.channel, body },
+          // 같은 레시피 실행의 같은 스텝은 한 번만 나간다 (R6.3). 재개해도
+          // 다시 나가지 않는 것이 R12.5 와 맞물리는 지점이다.
+          idempotencyKey: `${state.runId}:${step.id}`,
+          runId: state.runId,
+          ...(step.dryRun ? { dryRun: true } : {}),
+          // 판정이 있으면 **거짓도 그대로 넘긴다.** 빼먹으면 undefined 가 되고
+          // 브로커가 "브랜드 대조를 하지 않았다" 로 읽는다 — 대조해서 떨어진
+          // 것과 대조를 안 한 것은 오너가 할 일이 다르다.
+          ...(judged
+            ? {
+                brandPass: judged.brandPass,
+                brandNotes: judged.brandNotes,
+                assurance: judged.verdict,
+                assuranceNotes: judged.assuranceNotes,
+              }
+            : step.brandOk
+              ? { brandPass: true }
+              : {}),
+        });
+
+        if (!result.ok) {
+          st.status = 'failed';
+          st.detail = `발행 실패 — ${result.reason}${result.detail ? `: ${result.detail}` : ''}`;
+          // 체크리스트는 사람이 이어받는 자리다. 삼키지 않는다 (R6.6).
+          if (result.checklist?.length) st.detail += `\n  ${result.checklist.join('\n  ')}`;
+          return 'stop';
+        }
+
+        st.status = 'passed';
+        st.detail = result.reason === 'duplicate'
+          ? '이미 발행됨 — 다시 내보내지 않았다'
+          : result.payload !== undefined
+            ? '드라이런 — 실제로 나가지 않았다'
+            : `발행 완료${result.evidence?.url ? ` — ${result.evidence.url}` : ''}`;
+        if (result.evidence?.url) state.artifacts[`${step.id}.url`] = result.evidence.url;
+        return 'continue';
+      }
+
+      case 'studio': {
+        // Studio 는 좌석 산출 + 브랜드 대조까지 한다 (R5). 검증은 여기서 잇는다.
+        let packLoad: LoadedPack;
+        try {
+          packLoad = this.loadPack(step.pack);
+        } catch (err) {
+          // 규칙 파일을 못 읽었다. 빈 팩으로 넘어가면 "규칙이 없어서 통과" 가
+          // "대조해서 통과" 로 보고된다 — 여기서 멈춘다.
+          st.status = 'failed';
+          st.detail = `브랜드 팩을 읽지 못했다 (${step.pack}): ${(err as Error).message}`;
+          return 'stop';
+        }
+        const studio = new Studio({ broker: this.broker, ledger: this.ledger, pack: packLoad.pack });
+
+        const want = (step.want ?? ['copy']).filter((w): w is SlotKind =>
+          (SLOT_KINDS as readonly string[]).includes(w),
+        );
+        if (want.length === 0) {
+          st.status = 'failed';
+          st.detail = `채울 슬롯이 없다 — want 에 ${SLOT_KINDS.join(', ')} 중 하나가 필요하다`;
+          return 'stop';
+        }
+
+        const artifact = await studio.produce({
+          title: step.title ?? step.produce,
+          brief: buildSeatPrompt(step.brief, state.artifacts),
+          want,
+          runId: state.runId,
+          ...(state.tainted ? { tainted: true } : {}),
+        });
+
+        const body = artifact.slots
+          .filter((sl): sl is Extract<Slot, { state: 'filled' }> => sl.state === 'filled')
+          .map((sl) => sl.content)
+          .join('\n\n');
+
+        if (body === '') {
+          // 채워진 슬롯이 없다. 빈 본문을 산출물로 남기면 다음 스텝이
+          // 빈 자리로 발행한다 — 여기서 멈추는 편이 낫다.
+          st.status = 'failed';
+          st.detail =
+            '채워진 슬롯이 없다 — ' +
+            artifact.slots.map((sl) => `${sl.kind}: ${sl.state === 'filled' ? '충족' : (sl.reason ?? sl.state)}`).join(' / ');
+          return 'stop';
+        }
+
+        // 검증 (R11.3~R11.5). 근거 등급의 기준은 브랜드 팩의 콘텐츠 베이스다 —
+        // 팩에 없는 수치는 미검증이고, 미검증은 BLOCK 이다.
+        const claims = registerClaims(body, {
+          packFacts: packLoad.pack.contentBase.claims,
+          measured: [],
+        });
+        const assurance = assure({
+          text: body,
+          claims,
+          citations: extractCitations(body),
+          sei: { ran: false, note: 'sei CLI 가 설치되어 있지 않다 — 자체 검사만 돌렸다' },
+        });
+
+        const judgment: ArtifactJudgment = {
+          brandPass: artifact.brandPass === true,
+          brandNotes: artifact.brandNotes,
+          verdict: assurance.verdict,
+          // 공용 렌더러를 쓴다. `f.detail` 만 쓰면 위치가 빠져서, 같은 주장이
+          // 본문에 두 번 나올 때 똑같은 줄이 두 번 찍힌 것처럼 보인다 —
+          // 실제로 그렇게 보였고 중복 버그로 오해했다.
+          assuranceNotes: assurance.findings.map(describeAssuranceFinding),
+          packless: packLoad.packless,
+        };
+
+        state.artifacts[step.produce] = body;
+        state.judgments = { ...state.judgments, [step.produce]: judgment };
+
+        this.ledger.append({
+          actor: { kind: 'system', id: 'studio' },
+          kind: 'gate.verdict',
+          runId: state.runId,
+          payloadDigest: digestPayload(body),
+          summary:
+            `${step.produce} — 브랜드 ${judgment.brandPass ? 'PASS' : 'FAIL'}, 검증 ${judgment.verdict}` +
+            (judgment.packless ? ' (브랜드 팩 없음)' : ''),
+          evidence: [...judgment.brandNotes, ...judgment.assuranceNotes],
+        });
+
+        const summary =
+          `브랜드 ${judgment.brandPass ? 'PASS' : 'FAIL'}, 검증 ${judgment.verdict}` +
+          (judgment.packless ? ' (브랜드 팩 없이 대조 — 규칙이 없어서 통과한 것이다)' : '');
+
+        if (judgment.verdict === 'BLOCK' && !step.continueOnBlock) {
+          st.status = 'failed';
+          st.detail = [summary, ...judgment.assuranceNotes].join('\n  ');
+          return 'stop';
+        }
+
+        st.status = 'passed';
+        st.detail = [summary, ...judgment.brandNotes, ...judgment.assuranceNotes].join('\n  ');
+        return 'continue';
+      }
+
       case 'retro': {
-        // Task 9 / Task 13 에서 실물이 붙는다.
-        // 구현되지 않은 것을 통과로 처리하지 않는다 — 조용한 성공을 만들지 않는다.
-        st.status = 'failed';
-        st.detail = `${step.kind} 스텝은 아직 구현되지 않았다 (Task ${step.kind === 'publish' ? 9 : 13})`;
-        return 'stop';
+        // 예측이 없으면 복기가 아니다 (R11.6). 사후 소감을 복기라고 부르지 않는다.
+        if (!step.expect || Object.keys(step.expect).length === 0) {
+          const skipped = noPrediction(state.runId, step.subject);
+          st.status = 'failed';
+          st.detail = skipped.amendments.join(' / ');
+          return 'stop';
+        }
+
+        // 채널이 지정되면 실측을 읽는다. 브로커가 없거나 수집이 실패하면
+        // **0 으로 채우지 않고** null 을 넘긴다 — 전부 "수집 못 함" 이 되고
+        // 그 사실이 제안 맨 위에 올라간다 (R11.6). 못 읽은 것을 0 으로 보면
+        // "성과가 없었다" 로 읽혀 레시피를 잘못 고치게 된다.
+        // 복기 대상(`subject`)은 발행 스텝의 id 이고, 지표를 읽을 채널은
+        // 별도 필드다 — 스텝 하나가 여러 채널로 나갈 수 있다.
+        const observed = await this.collectActuals(step, state.runId);
+
+        const retro = compare(
+          {
+            runId: state.runId,
+            channel: step.subject,
+            expected: step.expect,
+            afterDays: step.afterDays,
+            at: new Date().toISOString(),
+          },
+          observed.actual,
+        );
+
+        this.ledger.append({
+          actor: { kind: 'system', id: 'retro' },
+          kind: 'retro',
+          runId: state.runId,
+          summary:
+            `복기 ${step.subject} — 지표 ${retro.gaps.length}건, ` +
+            `수집 못 함 ${retro.uncollected.length}건` +
+            (observed.why ? ` (${observed.why})` : ''),
+        });
+
+        state.artifacts[`${step.id}.amendments`] = retro.amendments.join('\n');
+        st.status = 'passed';
+        st.detail =
+          `복기 완료 — 제안 ${retro.amendments.length}건 (수집 못 함 ${retro.uncollected.length})` +
+          (observed.why ? ` — ${observed.why}` : '');
+        return 'continue';
       }
     }
+  }
+
+  /**
+   * 브랜드 팩을 읽는다.
+   *
+   * 파일을 못 읽으면 던진다 — 빈 팩으로 넘어가면 "규칙이 없어서 통과" 가
+   * "대조해서 통과" 로 보고된다. 경로를 안 적은 경우만 규칙 없음이고,
+   * 그 사실은 판정에 `packless` 로 남는다.
+   */
+  private loadPack(file: string | undefined): LoadedPack {
+    if (!file) return { pack: EMPTY_PACK, packless: true };
+    return { pack: this.readPack(file), packless: false };
+  }
+
+  /**
+   * 복기 실측을 읽는다 (R11.6).
+   *
+   * 못 읽었으면 `null` 을 돌려준다. 빈 객체가 아니다 — 빈 객체도 `compare` 가
+   * 미수집으로 처리하긴 하지만, **왜** 못 읽었는지를 같이 남겨야 다음 주에
+   * 고칠 수 있다. "지표가 안 나왔다" 와 "토큰이 없다" 는 다른 문제다.
+   */
+  private async collectActuals(
+    step: RetroStep,
+    runId: string,
+  ): Promise<{ actual: Observed | null; why: string | null }> {
+    if (!step.channel) return { actual: null, why: '채널 미지정 — 실측 없이 복기' };
+    if (!this.metrics) return { actual: null, why: '지표 브로커 없음' };
+    if (!isChannel(step.channel)) return { actual: null, why: `${step.channel} 은 알 수 없는 채널` };
+
+    const today = new Date().toISOString().slice(0, 10);
+    const outcome = await this.metrics.read(step.channel, {
+      from: step.from ?? today,
+      to: step.to ?? today,
+    });
+    if (!outcome.ok) return { actual: null, why: `지표 수집 실패 — ${outcome.detail}` };
+
+    // 집계값만 넘어온다 — 경계는 브로커가 이미 집행했다 (R7.6).
+    const actual: Record<string, number> = {};
+    for (const [k, v] of Object.entries(outcome.result.aggregate)) {
+      if (typeof v === 'number') actual[k] = v;
+    }
+    return {
+      actual: { runId, actual, at: new Date().toISOString() },
+      why:
+        outcome.result.uncollected.length > 0
+          ? `채널 미수집 ${outcome.result.uncollected.join(', ')}`
+          : null,
+    };
   }
 }
 

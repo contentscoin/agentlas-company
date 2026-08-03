@@ -202,8 +202,12 @@ cursor 에이전트 CLI는 미설치다. 자세한 실측값은 `SEAT-CONTRACT.m
 
 ## 업스트림
 
-`ai-company-discord` · `social-ai-team-custom` · `agentlas-sei` · `Agentlas-OS`
+`ai-company-discord` · `social-ai-team-custom` · `agentlas-sei` · `Agentlas-OS` · `agentlas-desktop`
 소스를 복사하지 않고 커밋 핀으로 소비한다. 자세한 고지는 `NOTICE.md`.
+
+`agentlas-desktop` 은 형제 제품이고 **실행 표면**을 담당한다 — Hands(computer-use),
+모바일 승인(mobile-bridge). 이쪽은 **통제 계층**을 담당한다 — 원장, 정책 게이트,
+능력 스위치, 오염 추적. 경계는 설계 §agentlas-desktop 경계에 있다.
 
 ## 라이선스
 

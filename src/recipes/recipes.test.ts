@@ -13,7 +13,13 @@ import { RecipeEngine, buildSeatPrompt } from './engine.js';
 import { RecipeError, loadRecipe, validateRecipe } from './load.js';
 import { RunLock } from './lock.js';
 import { emitForPlatform, launchdPlist, parseSchedule, schtasksCommand, systemdUnits } from './schedule.js';
-import type { Recipe } from './types.js';
+import type { Recipe, RetroStep } from './types.js';
+import { PublishBroker } from '../publish/broker.js';
+import { PublishStore } from '../publish/ledgerstore.js';
+import type { ChannelAdapter } from '../publish/types.js';
+import { MetricsBroker } from '../metrics/broker.js';
+import type { MetricsAdapter } from '../metrics/types.js';
+import type { BrandPack } from '../studio/brandpack.js';
 
 let dir: string;
 let ledger: Ledger;
@@ -64,7 +70,52 @@ function build(opts: { runner?: typeof echoRunner } = {}): {
     file: join(dir, 'approvals.json'),
   });
   const engine = new RecipeEngine({ ledger, broker, approvals, policy: POLICY, stateDir: dir });
-  return { engine, approvals };
+  return { engine, approvals, ledger };
+}
+
+/** 발행기를 물린 엔진. 실제로 나가지 않는 가짜 어댑터를 쓴다. */
+function buildWithPublisher(over: Partial<ChannelAdapter> = {}): {
+  engine: RecipeEngine;
+  approvals: ApprovalService;
+  calls: () => number;
+} {
+  const ledger = Ledger.open(join(dir, 'events.jsonl'));
+  const broker = new SeatBroker({ ledger, seats: [fakeSeat('codex', 'openai')], runner: echoRunner });
+  const approvals = new ApprovalService({ policy: POLICY, ledger, file: join(dir, 'approvals.json') });
+
+  let n = 0;
+  const adapter: ChannelAdapter = {
+    channel: 'threads',
+    path: 'api',
+    ready: () => ({ ok: true }),
+    describe: (v) => ({ preview: v }),
+    publish: async () => {
+      n += 1;
+      return {
+        ok: true as const,
+        evidence: { url: `https://example.test/p/${n}`, screenshots: [], notes: [] },
+      };
+    },
+    ...over,
+  };
+
+  const publisher = new PublishBroker({
+    ledger,
+    approvals,
+    policy: POLICY,
+    store: new PublishStore({ file: join(dir, 'published.json') }),
+    adapters: [adapter],
+    evidenceRoot: join(dir, 'evidence'),
+  });
+  const engine = new RecipeEngine({
+    ledger,
+    broker,
+    approvals,
+    policy: POLICY,
+    stateDir: dir,
+    publisher,
+  });
+  return { engine, approvals, calls: () => n };
 }
 
 beforeEach(() => {
@@ -312,19 +363,299 @@ describe('승인 스텝은 블로킹이 아니다', () => {
   });
 });
 
-describe('구현되지 않은 스텝은 통과로 처리하지 않는다', () => {
-  it('publish 스텝에서 멈춘다', async () => {
+describe('발행 스텝 (R6, R12)', () => {
+  const RECIPE = (over: Record<string, unknown> = {}) => ({
+    name: 'pub',
+    steps: [
+      { id: 'draft', kind: 'seat' as const, persona: 'studio', instruction: '초안', produce: 'draft' },
+      { id: 'pub', kind: 'publish' as const, channel: 'threads', subject: 'draft', ...over },
+    ],
+  });
+
+  it('발행기가 없으면 통과가 아니라 실패다 — 조용한 성공을 만들지 않는다', async () => {
     const { engine } = build();
+    const outcome = await engine.start(RECIPE({ brandOk: true }));
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toContain('발행기가 연결되지 않은');
+  });
+
+  it('앞 스텝 산출물을 본문으로 발행한다', async () => {
+    const { engine, calls } = buildWithPublisher();
+    const outcome = await engine.start(RECIPE({ brandOk: true, dryRun: true }));
+    expect(outcome.status).toBe('completed');
+    // 드라이런이므로 어댑터는 불리지 않는다.
+    expect(calls()).toBe(0);
+  });
+
+  it('없는 산출물을 참조하면 실행 중에 멈춘다', async () => {
+    const { engine } = buildWithPublisher();
     const outcome = await engine.start({
       name: 'pub',
-      steps: [
-        { id: 'draft', kind: 'seat', persona: 'studio', instruction: '초안', produce: 'draft' },
-        { id: 'pub', kind: 'publish', channel: 'threads', subject: 'draft' },
-      ],
+      steps: [{ id: 'pub', kind: 'publish', channel: 'threads', subject: '없는것', brandOk: true }],
     });
     expect(outcome.status).toBe('failed');
-    expect(outcome.reason).toContain('구현되지 않았다');
+    expect(outcome.reason).toContain('없는것');
   });
+
+  it('브랜드 대조를 선언하지 않으면 발행이 막힌다 (R5.5)', async () => {
+    const { engine, calls } = buildWithPublisher();
+    const outcome = await engine.start(RECIPE());
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toContain('brand-fail');
+    expect(calls()).toBe(0);
+  });
+
+  it('발행 실패의 체크리스트를 삼키지 않는다 (R6.6)', async () => {
+    const { engine } = buildWithPublisher({
+      ready: () => ({ ok: false, reason: '토큰 없음', checklist: ['토큰을 설정하세요'] }),
+    });
+    const outcome = await engine.start(RECIPE({ brandOk: true }));
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toContain('토큰을 설정하세요');
+  });
+});
+
+/** 지표 브로커를 물린 엔진. 어댑터는 주어진 원본을 그대로 돌려준다. */
+function buildWithMetrics(raw: unknown, over: Partial<MetricsAdapter> = {}): RecipeEngine {
+  ledger = Ledger.open(join(dir, 'events.jsonl'));
+  const broker = new SeatBroker({
+    ledger,
+    seats: [fakeSeat('codex', 'openai'), fakeSeat('claude', 'anthropic')],
+    runner: echoRunner,
+  });
+  const approvals = new ApprovalService({ policy: POLICY, ledger, file: join(dir, 'approvals.json') });
+  const metrics = new MetricsBroker({
+    ledger,
+    adapters: [
+      {
+        channel: 'smartstore',
+        path: 'hands',
+        metrics: ['orderCount', 'revenue'],
+        ready: () => ({ ok: true }),
+        read: async () => ({ ok: true as const, raw }),
+        ...over,
+      } as MetricsAdapter,
+    ],
+  });
+  return new RecipeEngine({ ledger, broker, approvals, policy: POLICY, stateDir: dir, metrics });
+}
+
+const RETRO_RECIPE = (retro: Partial<RetroStep>): Recipe => ({
+  name: 'retro',
+  steps: [
+    { id: 'draft', kind: 'seat', persona: 'studio', instruction: '초안', produce: 'draft' },
+    { id: 'r', kind: 'retro', afterDays: 7, subject: 'draft', expect: { orderCount: 100 }, ...retro },
+  ],
+});
+
+describe('복기가 실측을 읽는다 (R11.6)', () => {
+  it('채널이 지정되면 지표를 수집해 예측과 견준다', async () => {
+    const engine = buildWithMetrics({ orderCount: 128, revenue: 3450000 });
+    const outcome = await engine.start(RETRO_RECIPE({ channel: 'smartstore' }));
+    expect(outcome.status).toBe('completed');
+    const state = engine.loadRun(outcome.runId)!;
+    // 실측이 들어왔으므로 "수집 못 함" 이 0 이다.
+    expect(state.steps.find((s) => s.id === 'r')?.detail).toContain('수집 못 함 0');
+  });
+
+  it('채널이 없으면 실측 없이 돌고 그 사실을 남긴다', async () => {
+    const engine = buildWithMetrics({ orderCount: 128 });
+    const outcome = await engine.start(RETRO_RECIPE({}));
+    expect(outcome.status).toBe('completed');
+    const detail = engine.loadRun(outcome.runId)!.steps.find((s) => s.id === 'r')?.detail ?? '';
+    expect(detail).toContain('수집 못 함 1');
+    expect(detail).toContain('채널 미지정');
+  });
+
+  it('수집이 실패해도 0 으로 채우지 않는다', async () => {
+    const engine = buildWithMetrics(null, {
+      read: async () => ({ ok: false as const, detail: '화면 없음', checklist: [] }),
+    });
+    const outcome = await engine.start(RETRO_RECIPE({ channel: 'smartstore' }));
+    expect(outcome.status).toBe('completed');
+    const detail = engine.loadRun(outcome.runId)!.steps.find((s) => s.id === 'r')?.detail ?? '';
+    // 실패는 미수집이지 0 이 아니다 — 0 이면 "성과 없음" 으로 읽혀 레시피를 잘못 고친다.
+    expect(detail).toContain('수집 못 함 1');
+    expect(detail).toContain('화면 없음');
+  });
+
+  it('채널이 낸 지표에 고객 정보가 섞여 있어도 복기로 넘어가지 않는다 (R7.6)', async () => {
+    const engine = buildWithMetrics({ orderCount: 3, buyerName: '김OO' });
+    const outcome = await engine.start(RETRO_RECIPE({ channel: 'smartstore' }));
+    const state = engine.loadRun(outcome.runId)!;
+    expect(JSON.stringify(state)).not.toContain('김OO');
+  });
+});
+
+
+/**
+ * Studio 스텝을 돌릴 엔진. 좌석은 주어진 본문을 그대로 돌려준다.
+ * 발행기까지 물려 판정이 발행으로 이어지는지 본다.
+ */
+function buildStudio(
+  body: string,
+  opts: { pack?: BrandPack; over?: Partial<ChannelAdapter> } = {},
+): { engine: RecipeEngine; sent: () => string[] } {
+  ledger = Ledger.open(join(dir, 'events.jsonl'));
+  const broker = new SeatBroker({
+    ledger,
+    seats: [fakeSeat('codex', 'openai'), fakeSeat('claude', 'anthropic')],
+    runner: async (_spec, args) => {
+      writeFileSync(args[1]!, body, 'utf8');
+      return { code: 0, stdout: '', stderr: '', timedOut: false, ms: 3 };
+    },
+  });
+  const approvals = new ApprovalService({ policy: POLICY, ledger, file: join(dir, 'approvals.json') });
+
+  const sent: string[] = [];
+  const publisher = new PublishBroker({
+    ledger,
+    approvals,
+    policy: POLICY,
+    store: new PublishStore({ file: join(dir, 'published.json') }),
+    adapters: [
+      {
+        channel: 'threads',
+        path: 'api',
+        ready: () => ({ ok: true }),
+        describe: (v) => ({ preview: v }),
+        publish: async (verb) => {
+          sent.push((verb as { body: string }).body);
+          return { ok: true as const, evidence: { url: 'https://example.test/p/1', screenshots: [], notes: [] } };
+        },
+        ...opts.over,
+      } as ChannelAdapter,
+    ],
+    evidenceRoot: join(dir, 'evidence'),
+  });
+
+  const engine = new RecipeEngine({
+    ledger,
+    broker,
+    approvals,
+    policy: POLICY,
+    stateDir: dir,
+    publisher,
+    ...(opts.pack ? { loadBrandPack: () => opts.pack as BrandPack } : {}),
+  });
+  return { engine, sent: () => sent };
+}
+
+const STUDIO_RECIPE = (over: { studio?: Record<string, unknown>; publish?: Record<string, unknown> } = {}): Recipe => ({
+  name: 'studio-cycle',
+  steps: [
+    { id: 'draft', kind: 'studio', brief: '초안을 써라', produce: 'body', ...over.studio } as never,
+    // publish.threads 는 L1 이라 승인이 필요하다. 이 시험의 대상은 판정 전달이지
+    // 승인 흐름이 아니므로 드라이런으로 돌린다 — 브랜드·검증 게이트는
+    // 드라이런보다 앞이라 그대로 걸린다.
+    { id: 'send', kind: 'publish', channel: 'threads', subject: 'body', dryRun: true, ...over.publish } as never,
+  ],
+});
+
+describe('Studio 스텝이 판정을 산출물에 묶는다 (R5, R11.5)', () => {
+  // DoD 기본값이 최소 50자·인용 1건이라 그 아래로는 FAIL 이 난다.
+  const CLEAN =
+    '이번 신제품은 일상에서 쓰기 편하도록 손잡이 각도와 무게 배분을 다시 잡았습니다. ' +
+    '사용자 인터뷰에서 나온 불편을 그대로 반영했습니다.\n[출처] 자체 사용성 조사 2026-07';
+
+  it('브랜드·검증을 통과하면 발행까지 간다', async () => {
+    const { engine } = buildStudio(CLEAN);
+    const outcome = await engine.start(STUDIO_RECIPE());
+    expect(outcome.status, outcome.reason).toBe('completed');
+
+    const state = engine.loadRun(outcome.runId)!;
+    expect(state.steps.find((x) => x.id === 'send')?.status).toBe('passed');
+    expect(state.judgments?.['body']?.brandPass).toBe(true);
+    expect(state.judgments?.['body']?.verdict).toBe('PASS');
+  });
+
+  /**
+   * 이것이 18.3 의 핵심이다. 예전에는 레시피에 `brandOk: true` 를 적으면
+   * 브랜드 대조 없이 발행으로 갔다.
+   */
+  it('레시피의 brandOk 선언이 실제 대조 결과를 덮지 못한다', async () => {
+    // 브랜드만 걸리고 검증은 통과하는 본문을 쓴다 — 두 게이트를 섞으면
+    // 무엇이 막았는지 알 수 없다.
+    const pack: BrandPack = {
+      masterSheet: { forbidden: ['대박'], required: [] },
+      characters: [],
+      contentBase: { claims: [] },
+    };
+    const { engine } = buildStudio('이번 신제품 대박입니다.', { pack });
+    const outcome = await engine.start(
+      STUDIO_RECIPE({ studio: { pack: 'pack.json' }, publish: { brandOk: true } }),
+    );
+
+    expect(outcome.status).toBe('failed');
+    expect(outcome.stoppedAt).toBe('send');
+    // 대조해서 떨어진 것이지 대조를 안 한 것이 아니다 — 오너가 할 일이 다르다.
+    expect(outcome.reason).toContain('브랜드 위반');
+    expect(outcome.reason).not.toContain('대조를 하지 않았다');
+    const state = engine.loadRun(outcome.runId)!;
+    expect(state.judgments?.['body']?.brandPass).toBe(false);
+    // 선언을 무시했다는 사실이 원장에 남는다 — 조용히 덮지 않는다.
+    expect(ledger.query({ kind: 'deny' }).some((e) => e.summary?.includes('brandOk'))).toBe(true);
+  });
+
+  it('검증 BLOCK 이면 좌석 호출을 더 쓰지 않고 멈춘다 (R11.5)', async () => {
+    // 근거 없는 수치는 미검증이고, 미검증은 BLOCK 이다.
+    const { engine } = buildStudio('전환율이 47% 올랐습니다.');
+    const outcome = await engine.start(STUDIO_RECIPE());
+    expect(outcome.status).toBe('failed');
+    expect(outcome.stoppedAt).toBe('draft');
+    expect(outcome.reason).toContain('BLOCK');
+  });
+
+  it('continueOnBlock 이면 계속하되 발행 브로커가 막는다', async () => {
+    const { engine } = buildStudio('전환율이 47% 올랐습니다.');
+    const outcome = await engine.start(STUDIO_RECIPE({ studio: { continueOnBlock: true } }));
+    // 스텝은 지나가지만 발행은 나가지 않는다 — 게이트가 둘이다.
+    expect(outcome.status).toBe('failed');
+    expect(outcome.stoppedAt).toBe('send');
+    // 근거 없는 수치는 브랜드 대조와 검증 **양쪽**에 걸린다 — 두 게이트가
+    // 같은 콘텐츠 베이스를 보므로 판정이 갈리지 않는다.
+    const st = engine.loadRun(outcome.runId)!;
+    expect(st.judgments?.['body']?.verdict).toBe('BLOCK');
+  });
+
+  it('브랜드 팩 없이 대조한 것을 대조했다고 보고하지 않는다', async () => {
+    const { engine } = buildStudio(CLEAN);
+    const outcome = await engine.start(STUDIO_RECIPE());
+    const state = engine.loadRun(outcome.runId)!;
+    expect(state.judgments?.['body']?.packless).toBe(true);
+    expect(state.steps.find((x) => x.id === 'draft')?.detail).toContain('브랜드 팩 없이');
+  });
+
+  it('브랜드 팩 파일을 못 읽으면 빈 팩으로 넘어가지 않는다', async () => {
+    const { engine } = buildStudio(CLEAN);
+    // loadBrandPack 을 주지 않았으므로 실제 파일을 읽으려 한다.
+    const outcome = await engine.start(STUDIO_RECIPE({ studio: { pack: join(dir, '없는팩.json') } }));
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toContain('브랜드 팩을 읽지 못했다');
+  });
+
+  it('채워진 슬롯이 없으면 빈 본문을 산출물로 남기지 않는다', async () => {
+    const { engine } = buildStudio(CLEAN);
+    // image 는 desktop 표면이 없어 막힌 슬롯이다.
+    const outcome = await engine.start(STUDIO_RECIPE({ studio: { want: ['image'] } }));
+    expect(outcome.status).toBe('failed');
+    expect(outcome.reason).toContain('채워진 슬롯이 없다');
+  });
+
+  it('Studio 를 거치지 않은 산출물은 예전처럼 brandOk 선언을 쓴다', async () => {
+    const { engine } = buildStudio(CLEAN);
+    const outcome = await engine.start({
+      name: 'seat-then-publish',
+      steps: [
+        { id: 'draft', kind: 'seat', persona: 'cmo', instruction: '초안', produce: 'body' },
+        { id: 'send', kind: 'publish', channel: 'threads', subject: 'body', brandOk: true, dryRun: true },
+      ],
+    });
+    expect(outcome.status, outcome.reason).toBe('completed');
+  });
+});
+
+describe('구현되지 않은 스텝은 통과로 처리하지 않는다', () => {
 
   it('retro 스텝에서 멈춘다', async () => {
     const { engine } = build();

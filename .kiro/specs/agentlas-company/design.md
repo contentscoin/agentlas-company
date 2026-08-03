@@ -10,7 +10,22 @@
 
 **주 언어는 Node/TypeScript.** 상위 프로젝트(`ai-company-discord`)는 Python 단일을 골랐고 근거는 재사용 로직이 전부 Python이라는 것이었습니다. 우리 조건은 다릅니다. 최대 재사용 자산이 `proc.js`(Windows 인용·PATH·프로세스 트리 종료를 이미 해결한 코드)이고, 새로 만들 무거운 셋 — Hands(CDP 브라우저 조작), 라이브 스트림(SSE), 모바일 PWA — 이 전부 Node 생태계에 두껍습니다.
 
-**Python 업스트림은 서브프로세스로 소비.** `companyctl`과 `sei`가 `--json` 출력과 균일한 종료 코드(0 성공 / 1 발견 / 2 실행 불가)를 출하했으므로 그 계약에만 바인딩하고 내부 구현에는 의존하지 않습니다.
+**Python 업스트림은 서브프로세스로 소비.** `--json` 출력에만 바인딩하고 내부 구현에는 의존하지 않습니다.
+
+> **정정(2026-08-03, Task 18.1).** 위 문장은 원래 "`companyctl`과 `sei`가 `--json` 출력과 **균일한 종료 코드(0 성공 / 1 발견 / 2 실행 불가)** 를 출하했으므로" 라고 적혀 있었습니다. `contentscoin/agentlas-sei` v0.3.0 을 붙여 실측한 결과 **그런 계약이 아닙니다.**
+>
+> | 종료 코드 | 실제 의미 |
+> | --- | --- |
+> | 0 | 성공 — `inspect` 는 **high 심각도 발견이 있어도 0** |
+> | 2 | 실행 불가(SEIError/OSError) 또는 `validate` 상태 무효 |
+> | 3 | `self-audit` 미통과 |
+> | 4 | `gate`/`review` 미허가 |
+>
+> **`1`(발견)은 존재하지 않습니다.** 그래서 `sei inspect` 를 레시피 게이트 명령으로 그대로 쓰면 high 발견 4건에도 게이트가 **통과**합니다(실측 확인). 위험 신호는 반드시 **JSON 본문**에서 읽어야 하고, 종료 코드는 "돌았는가" 만 판정합니다.
+>
+> 설계가 기대한 균일 계약은 우리가 **제공**합니다 — `company sei` 가 0/1/2 로 나가므로 레시피 `gate` 스텝이 그대로 씁니다. `src/assurance/sei.ts` 참조.
+>
+> 또한 SEI 의 검사 대상은 **코드 프로젝트**입니다(모든 하위 명령이 프로젝트 디렉터리를 받습니다). 게시물 본문을 검사시킬 명령이 없으므로 `company assure <본문>` 에서 SEI 는 "설치되지 않음" 이 아니라 **대상이 아님** 입니다.
 
 **좌석 호출은 매번 일회성 비대화형 실행.** 장기 세션을 유지하지 않습니다. 구독 CLI가 장수 세션을 보장하지 않고, 상태가 프로세스에 숨으면 크래시 복구와 재현이 불가능해집니다. 비용은 매 호출마다 컨텍스트를 다시 싣는 것이고, 이를 **컨텍스트 팩**(역할 정의 + 관련 원장 발췌 + 인용 팩)으로 조립해 재현 가능하게 만듭니다. 같은 팩으로 같은 호출을 다시 돌릴 수 있어야 합니다.
 
@@ -73,6 +88,60 @@ flowchart TB
     OFFICE --> LED
     LED -->|"SSE tail"| OWNER
 ```
+
+## agentlas-desktop 경계
+
+`agentlas-desktop`(v0.9.29, Electron+Next, TS/TSX 627개)은 형제 제품이고 **실행 표면을 이미 가졌습니다.** Task 9~17 을 세울 때 이 저장소를 계산에 넣지 않았고, 그래서 Hands·모바일·Studio·채용을 처음부터 만들 계획이었습니다. 그 계획을 정정합니다.
+
+**분업 원칙: company 는 통제, desktop 은 실행.** company 가 고유하게 가진 것은 desktop 에 없습니다 — 해시체인 원장, 정책 등급·승인 게이트, 능력 스위치, 오염 추적, 크로스벤더 회의 프로토콜. desktop 이 가진 것은 company 에 없습니다 — 네이티브 입력 드라이버, CDP 브라우저, 모바일 페어링·릴레이, 좌석 런타임 어댑터 7종(11,185줄). 겹치는 것을 두 번 만들지 않습니다.
+
+**연동 가능 범위는 헤드리스 도달성이 정합니다.** desktop 기능의 대부분은 `electron/ipc.ts` 의 `ipcMain.handle` **486개** 뒤에 있고, 이건 Electron 렌더러에서만 호출됩니다. company 는 헤드리스 CLI이므로 닿지 않습니다. 밖으로 나온 표면은 넷뿐입니다.
+
+| desktop 표면 | 프로토콜 | 플랫폼 | company 쪽 소비자 |
+|---|---|---|---|
+| `mcp-tools/browser-cdp-launcher.ts` | MCP stdio (`@playwright/mcp` 프록시) | 전부 | **Hands Executor (Task 10)** |
+| `mobile-bridge/server.ts` | HTTPS/WSS + 페어링 + authority | 전부 | **없음** — 아래 참조 |
+| `browser/approval-server.ts` | loopback HTTP | 전부 | 런처가 직접 호출 (민감 행동 승인) |
+| `mcp-tools/registry.ts` | 외부 MCP 등록 (stdio/sse/http) | 전부 | company 를 도구로 등록 (Task 16) |
+| `computer-use/control-server.ts` | loopback HTTP + Bearer | **macOS 전용** | 없음 — 아래 참조 |
+
+**computer-use 는 macOS 전용입니다.** `control-server.ts:236` 이 `process.platform !== 'darwin'` 이면 서버를 띄우지 않고, `native-driver.ts:47` 도 같으며 `native/` 에는 `macos` 만 있습니다. 우리 운영 대상은 Windows(§Windows 배치)이므로 이 표면은 **쓰지 않습니다.** 1차 재정의(2026-08-02)는 Task 10 을 여기 붙인다고 적었고 그것은 틀렸습니다 — 그대로 만들었다면 대상 플랫폼에서 한 줄도 돌지 않았을 것입니다.
+
+Hands 가 실제로 붙는 곳은 desktop 이 `~/.agentlas/agentlas-browser-cdp.mjs` 로 물질화하는 CDP 런처입니다. 의존성 0 의 순수 node 스크립트이고, 전용 Chrome 프로필(`~/.agentlas/chrome-cdp-profile`)을 원격 디버깅 포트로 띄운 뒤 `@playwright/mcp` 를 CDP 로 붙입니다. 로그인 세션이 유지된 전용 프로필이라는 점이 R7.1 그 자체이고, 신선한 임시 프로필이 봇 차단에 걸리는 문제를 desktop 이 이미 풀어 놓았습니다.
+
+**조작 하나에 게이트가 둘입니다.** company 의 승인 게이트를 통과해도, 런처가 결제·게시·삭제·임의코드를 감지하면 desktop 승인 UI 로 다시 막습니다. 런처는 현재 페이지 URL 을 CDP 로 확인할 수 없으면 민감 행동을 진행하지 않습니다(fail-closed). 우리 게이트를 지나 desktop 게이트에서 멈추는 것은 정상 동작이며, 실행기는 그것을 `step-failed` 로 보고하고 체크리스트를 냅니다.
+
+**mobile-bridge 는 붙일 수 없습니다.** 크로스플랫폼이고 밖으로 나와 있지만, `projector.ts` 가 desktop 내부 스토어(`../store/firms`, `../store/projects`, `../confirm`, `../secrets/vault`, `../usage`, `../one/*`)를 직접 import 해 **자기 상태만** 투영합니다. 외부 시스템을 끼울 확장점·피드·설정이 없습니다. 브리지는 desktop 이 아는 것을 폰에 보여주는 닫힌 투영이고, company 의 원장·승인·능력 스위치는 desktop 이 모릅니다. Task 10 의 computer-use 가 **플랫폼** 문제였다면 이쪽은 **결합도** 문제이며, 어느 쪽도 company 코드로는 풀리지 않습니다.
+
+그래서 오피스 API 는 company 가 전부 소유합니다(`src/office/`). 모바일 표면을 어떻게 낼지는 열려 있습니다 — company 가 PWA 를 직접 내거나, desktop 에 확장점 PR 을 올리거나, company 를 MCP 도구로 등록(Task 16)하는 셋 중 하나입니다.
+
+단계별 인증은 TOTP(RFC 6238)입니다. 설계 초안은 desktop 페어링 기기를 두 번째 요소로 쓰려 했으나 위 결합도 문제로 불가능합니다. TOTP 는 소유 요소(폰)를 검증하면서 company 밖에 의존하지 않고, 기본 검증기가 **전부 거부**라 등록하지 않은 채로 L3 이 열리지 않습니다.
+
+Hands 가 노출하는 동사는 8종뿐입니다. `@playwright/mcp` 의 도구는 훨씬 많지만 전부 열지 않습니다 — `browser_evaluate`(임의 JS 실행은 자유 텍스트가 실행이 되는 바로 그 경로), `browser_cookie_*`·`browser_localstorage_*`(자격증명 표면은 좌석 구역이 읽을 것이 아닙니다, R15), `browser_mouse_*_xy`(좌표 조작은 화면이 바뀌면 조용히 엉뚱한 곳을 누릅니다). 제외 목록과 이유는 `src/hands/types.ts` 주석에 고정해 두었습니다.
+
+**MCP 등록은 집행이 아닙니다.** desktop 의 외부 MCP 레지스트리에 company 를 stdio 서버로 올리면 desktop 안의 에이전트가 원장 기록·승인 요청을 **할 수 있게** 됩니다. 하지만 desktop 자신의 동작이 우리 게이트를 **거치지는** 않습니다. MCP 는 도구를 제공하지 호출을 가로채지 않습니다. 이 구분을 흐리면 "초록인데 틀린 상태"가 됩니다 — 원장에 기록은 쌓이는데 아무것도 막지 못하는 상태.
+
+그래서 집행은 **실행 표면이 실행 전에 직접 묻는** 형태로 만들었습니다 (Task 16.0 완료).
+
+```
+desktop installAgent()  ──spawn──▶  company gate --action agent.borrow --digest <d> --json
+                                          │
+                                          ├─ 종료 0  인가        → persistListing() 진행
+                                          ├─ 종료 1  거부        → throw, 설치 중단
+                                          └─ 종료 2  묻지 못함    → throw, 설치 중단
+```
+
+계약의 세부는 셋입니다.
+
+- **종료 2 를 1 과 구분합니다.** "안 된다고 답했다"와 "물어보지 못했다"는 다른 사실이고 답인 것은 앞의 하나뿐입니다. 다만 처리는 둘 다 거부입니다 — 2 를 통과로 해석하면 게이트를 끄는 방법이 게이트를 고장내는 것이 됩니다. spawn 실패·타임아웃도 같습니다.
+- **CLI 경로는 절대 경로여야 합니다.** 맨 이름은 PATH 로 해석되고, 그러면 PATH 섀도잉이 진짜 게이트를 대신해 "허용"이라 답하는 경로가 됩니다. 보안 통제를 PATH 로 해석하지 않습니다.
+- **승인은 동작을 결정하는 필드의 digest 에 묶입니다** — 지시문·trust grade·MCP 서버·env 요구 키 + Hub 릴리스 해시. Hub 가 준 `packageHash` 를 단독으로 신뢰하지 않는 이유는, 같은 해시로 내용만 바뀐 패키지가 무해한 버전에 내준 승인을 재사용할 수 있기 때문입니다 (R4.6).
+
+프로세스 경계를 넘는 것은 식별자뿐입니다. 지시문과 env 값은 넘어가지 않습니다.
+
+기본은 꺼져 있습니다. `AGENTLAS_COMPANY_GATE_CLI` 가 없으면 desktop 은 단독 제품으로 그대로 동작합니다. 켠다는 것은 막힐 수 있다는 데 동의한다는 뜻입니다.
+
+**재사용 자산이 없는 것도 확정했습니다.** desktop 에 채널 발행 구현은 없습니다. `creative-pack/`·`ecommerce-pack/` 은 각각 `surface.ts` 하나이고 `threads`·`instagram` 은 `experience/taxonomy.ts` 와 `mcp-tools/catalog.ts` 의 문자열입니다. 따라서 **Task 9(첫 발행 루프)는 그대로 company 의 자체 구현으로 남습니다.** 요구사항의 "빈 기계 리스크"가 지목한 우선순위는 이 정정 이후에도 유효합니다.
 
 ## Seat Broker
 

@@ -14,6 +14,7 @@ import { uptime } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Ledger } from '../ledger/ledger.js';
 import { resolveState } from '../paths.js';
+import { ensurePrivateDir, writePrivateFile } from '../zones/private.js';
 import {
   RISKY_CAPABILITIES,
   type Caller,
@@ -98,7 +99,7 @@ export class CapabilityStore {
     this.notify = opts.notify ?? ((): void => {});
     this.bootId = opts.bootId ?? currentBootId;
     this.now = opts.now ?? Date.now;
-    mkdirSync(dirname(this.file), { recursive: true });
+    ensurePrivateDir(dirname(this.file));
   }
 
   /** 진행 중 작업이 전체 차단에 반응할 수 있게 등록한다 (R8.13). */
@@ -157,7 +158,7 @@ export class CapabilityStore {
   }
 
   private save(map: Map<RiskyCapability, CapabilityState>): void {
-    writeFileSync(this.file, JSON.stringify({ states: [...map.values()] }, null, 2), 'utf8');
+    writePrivateFile(this.file, JSON.stringify({ states: [...map.values()] }, null, 2));
   }
 
   /**

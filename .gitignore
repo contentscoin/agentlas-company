@@ -24,6 +24,13 @@ SEAT-CONTRACT.local.md
 # 브라우저 프로필 (쿠키 확산 방지)
 /browser-profiles/
 
+# playwright-mcp 가 CWD 에 쓰는 스냅샷 원문.
+#
+# 접근성 트리 전문이라 고객 이름·연락처·주소가 평문으로 들어간다. 실행기가
+# 소유자 전용 작업 디렉터리에서 서버를 띄우므로 여기 떨어질 일이 없어야
+# 하지만, 다른 경로로 playwright-mcp 를 직접 돌리는 경우까지 막는 뒷단이다.
+.playwright-mcp/
+
 # 증거물
 /artifacts/screenshots/
 /artifacts/evidence/

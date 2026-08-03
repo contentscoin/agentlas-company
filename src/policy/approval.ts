@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Ledger } from '../ledger/ledger.js';
+import { ensurePrivateDir, writePrivateFile } from '../zones/private.js';
 import type {
   ApprovalOutcome,
   ApprovalRequest,
@@ -57,7 +58,22 @@ export class ApprovalService {
     this.file = opts.file;
     this.notify = opts.notify ?? ((): void => {});
     this.now = opts.now ?? Date.now;
-    if (this.file) mkdirSync(dirname(this.file), { recursive: true });
+    if (this.file) ensurePrivateDir(dirname(this.file));
+    this.load();
+  }
+
+  /**
+   * 디스크 상태를 다시 읽는다.
+   *
+   * 생성자에서 한 번만 읽던 것을 매 조회마다 읽도록 바꿨다. CLI 는 명령마다
+   * 새 프로세스라 문제가 드러나지 않았지만, 오피스 API 서버는 장수 프로세스다 —
+   * 기동 이후 다른 프로세스가 만든 승인 카드를 영영 보지 못했다. 폰에 대기
+   * 승인이 안 뜨는 형태로 Task 14 실측에서 잡혔다.
+   *
+   * 병합이라 메모리에만 있는 항목은 남는다. 모든 변경이 즉시 save() 하므로
+   * 디스크가 정본이고, 승인은 삭제되지 않고 상태만 바뀌므로 병합으로 충분하다.
+   */
+  refresh(): void {
     this.load();
   }
 
@@ -75,7 +91,7 @@ export class ApprovalService {
 
   private persist(): void {
     if (!this.file) return;
-    writeFileSync(this.file, JSON.stringify({ requests: [...this.requests.values()] }, null, 2), 'utf8');
+    writePrivateFile(this.file, JSON.stringify({ requests: [...this.requests.values()] }, null, 2));
   }
 
   /** 만료를 정리한다. 만료는 취소이며 통과가 아니다 (R4.7). */
@@ -131,13 +147,39 @@ export class ApprovalService {
   }
 
   get(id: string): ApprovalRequest | undefined {
+    this.load();
     this.sweep();
     return this.requests.get(id);
   }
 
   pending(): ApprovalRequest[] {
+    this.load();
     this.sweep();
     return [...this.requests.values()].filter((r) => r.status === 'pending');
+  }
+
+  /**
+   * 같은 작업·같은 digest 의 아직 열려 있는 요청을 찾는다.
+   *
+   * 게이트(gate.ts)가 매 시도마다 새 카드를 만들면 오너 화면이 같은 요청의
+   * 사본으로 덮이고, 그중 하나만 승인해도 나머지가 남아 무엇이 인가된 것인지
+   * 흐려진다. 열린 카드가 있으면 그것을 재사용한다.
+   *
+   * 종단 상태(거부·만료·중단·소비·무효)는 열린 것이 아니므로 여기 걸리지 않는다.
+   * 따라서 거부된 요청을 재시도하면 **새 카드가 만들어진다** — 거부가 영구
+   * 차단이 아니라는 뜻이다. 영구 차단으로 두지 않은 이유는 해제 경로가 없어서
+   * 오너가 같은 패키지를 영원히 설치할 수 없게 되기 때문이다. 재시도의 대가는
+   * 매번 오너 승인을 다시 받아야 하는 것이고, 모든 시도가 원장에 남는다.
+   */
+  findOpen(action: string, payloadDigest: string): ApprovalRequest | undefined {
+    this.load();
+    this.sweep();
+    return [...this.requests.values()].find(
+      (r) =>
+        r.action === action &&
+        r.payloadDigest === payloadDigest &&
+        (r.status === 'pending' || r.status === 'approved'),
+    );
   }
 
   /**
@@ -148,6 +190,7 @@ export class ApprovalService {
    * 인증 성공 여부와 무관하게 기록해야 할 사건이기 때문이다.
    */
   approve(id: string, by: Submitter, payloadDigest: string): ApprovalOutcome {
+    this.load();
     this.sweep();
     const request = this.requests.get(id);
     if (!request) return { ok: false, request: missing(id), reason: '없는 승인 요청' };
@@ -209,6 +252,7 @@ export class ApprovalService {
   }
 
   reject(id: string, by: Submitter, reason = '오너 거부'): ApprovalOutcome {
+    this.load();
     this.sweep();
     const request = this.requests.get(id);
     if (!request) return { ok: false, request: missing(id), reason: '없는 승인 요청' };
@@ -268,6 +312,7 @@ export class ApprovalService {
    * 남기면 "개별 실행마다 승인" (R8.6) 이 무의미해진다.
    */
   consume(id: string, payloadDigest: string): ConsumeOutcome {
+    this.load();
     this.sweep();
     const request = this.requests.get(id);
     if (!request) return { allowed: false, reason: 'not-found' };

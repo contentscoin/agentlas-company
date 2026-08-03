@@ -21,7 +21,8 @@
     "gates": "npm run gate:apikey && npm run gate:flags && npm run gate:liveness",
     "verify": "npm run gates && npm run build && npm run test",
     "demo:approval": "npm run build && node scripts/demo-approval.mjs",
-    "demo:injection": "npm run build && node scripts/demo-injection.mjs"
+    "demo:injection": "npm run build && node scripts/demo-injection.mjs",
+    "zones:emit": "node scripts/zones/emit-icacls.mjs > scripts/zones/setup-zones.ps1"
   },
   "devDependencies": {
     "@types/node": "26.1.2",
