@@ -11,9 +11,13 @@
  * 위치에 서고, 둘 다 통과해야 나간다.
  */
 
-import type { Claim } from './claims.js';
+import { isAdvisory, type Claim } from './claims.js';
 
-export type FindingKind = 'unsourced-number' | 'contradiction' | 'evidence-gap';
+export type FindingKind =
+  | 'unsourced-number'
+  | 'unsourced-advisory'
+  | 'contradiction'
+  | 'evidence-gap';
 
 export interface AssuranceFinding {
   kind: FindingKind;
@@ -103,12 +107,26 @@ export function assure(input: AssureInput): AssuranceResult {
   const dod = input.dod ?? DEFAULT_DOD;
   const findings: AssuranceFinding[] = [];
 
-  // 출처 없는 수치 (R11.3).
-  const unverified = input.claims.filter((c) => c.grade === 'unverified');
+  // 출처 없는 주장 (R11.3).
+  //
+  // **권고 종류는 따로 센다.** 검출하고 보고하되 발행을 막지 않는다 —
+  // 왜 그렇게 나눴는지는 `claims.ts` 의 `ADVISORY_KINDS` 주석에 실측과 함께
+  // 적어 두었다. 여기서 다시 판단하지 않는다.
+  const allUnverified = input.claims.filter((c) => c.grade === 'unverified');
+  const unverified = allUnverified.filter((c) => !isAdvisory(c.kind));
+  const advisory = allUnverified.filter((c) => isAdvisory(c.kind));
+
   for (const c of unverified) {
     findings.push({
       kind: 'unsourced-number',
       detail: `근거 없는 주장 "${c.text}" — 팩 인용도 실측도 아니다`,
+      index: c.index,
+    });
+  }
+  for (const c of advisory) {
+    findings.push({
+      kind: 'unsourced-advisory',
+      detail: `근거 없는 주장 "${c.text}" — 확인하면 좋습니다 (발행은 막지 않습니다)`,
       index: c.index,
     });
   }

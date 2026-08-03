@@ -213,3 +213,94 @@ describe('레시피 수정 제안 (R11.7)', () => {
     expect(renderRetro(r).join('\n')).toContain('수집못함');
   });
 });
+
+describe('패턴 없는 주장 (Task 11.4)', () => {
+  /**
+   * 실좌석 산출물 14편(5,379자)을 재고 정했다. 수치·순위·의학 표현만 잡던
+   * 시절에는 "업계를 선도합니다" 류가 그대로 통과했다.
+   */
+  it('접두어 없는 최상급·선도 주장을 잡는다', () => {
+    const claims = extractClaims('최고의 기술력으로 업계를 선도하는 기준이 되겠습니다.');
+    const kinds = claims.map((c) => c.kind);
+    expect(kinds).toContain('superlative-bare');
+    expect(claims.map((c) => c.text)).toEqual(expect.arrayContaining(['최고의', '선도하']));
+  });
+
+  /**
+   * 넓히면 일상어가 걸린다. `최적화`·`최소한`·`최고치` 는 주장이 아니다.
+   */
+  it('일상어를 주장으로 잡지 않는다', () => {
+    for (const t of ['쿼리를 최적화했습니다', '최소한 이것은 필요합니다', '올해 최고치를 기록', '최고급 자재']) {
+      expect(extractClaims(t).filter((c) => c.kind === 'superlative-bare'), t).toEqual([]);
+    }
+  });
+
+  /**
+   * 코퍼스에서 형용사 과장(강력한 3건·획기적 1건·근본적 1건)이 최상급 주장
+   * (2건)보다 많았다. 전부 검증할 수 없는 수사라 넣지 않았다.
+   */
+  it('검증할 수 없는 수사는 주장이 아니다', () => {
+    const claims = extractClaims('강력한 검색과 획기적인 개선, 근본적인 재정의, 혁신적 접근');
+    expect(claims).toEqual([]);
+  });
+
+  it('접두어 있는 최상급과 겹쳐 두 번 등록하지 않는다', () => {
+    const claims = extractClaims('업계 1위 입니다.');
+    expect(claims).toHaveLength(1);
+    expect(claims[0]?.kind).toBe('superlative');
+  });
+
+  /**
+   * 점검 공지의 "2026년 8월 3일" 이 기간 주장으로 잡혔다.
+   */
+  it('날짜를 기간 주장으로 세지 않는다', () => {
+    const claims = extractClaims('점검 일시: 2026년 8월 3일(월) 00:00 ~ 02:00 (총 2시간)');
+    expect(claims.map((c) => c.text)).toEqual(['2시간']);
+  });
+
+  it('날짜를 가려도 뒤 주장의 위치가 어긋나지 않는다', () => {
+    const text = '2026년 8월 3일 공지 — 매출 500만원';
+    const claim = extractClaims(text).find((c) => c.kind === 'quantity');
+    expect(claim).toBeTruthy();
+    // 가릴 때 길이를 보존하므로 위치가 원문을 그대로 가리킨다.
+    expect(text.slice(claim!.index, claim!.index + claim!.text.length)).toBe(claim!.text);
+  });
+
+  /**
+   * 차단 대상인 quantity 가 한국어 금액·수량을 통째로 놓치고 있었다.
+   * `500만원` 은 `\d+원` 에 걸리지 않는다 — 사이에 만이 있다.
+   */
+  it('만·억 단위 금액과 수량을 놓치지 않는다', () => {
+    for (const t of ['매출 500만원', '3억 원 투자', '고객 1,200만 명', '주문 2만 건']) {
+      const q = extractClaims(t).filter((c) => c.kind === 'quantity');
+      expect(q.length, t).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('권고는 검출하되 막지 않는다 (R11.3, R11.5)', () => {
+  const facts = { packFacts: [], measured: [] };
+
+  /**
+   * 실측: 서비스 점검 안내가 "총 2시간" 때문에 BLOCK 됐다. 막으면 사람들은
+   * 검증을 끄게 되고, 끈 검증은 없는 검증이다.
+   */
+  it('기간만 있는 운영 공지는 막히지 않는다', () => {
+    const text = '점검 일시: 00:00 ~ 02:00 (총 2시간). 서비스 이용이 제한됩니다. 양해 부탁드립니다.';
+    const r = assure({ text, claims: registerClaims(text, facts), citations: [] });
+    expect(r.verdict).not.toBe('BLOCK');
+  });
+
+  it('막지 않아도 보고는 한다 — 조용히 버리지 않는다', () => {
+    const text = '점검 일시: 00:00 ~ 02:00 (총 2시간). 서비스 이용이 제한됩니다. 양해 부탁드립니다.';
+    const r = assure({ text, claims: registerClaims(text, facts), citations: [] });
+    expect(r.findings.some((f) => f.kind === 'unsourced-advisory')).toBe(true);
+    expect(r.claims.some((c) => c.kind === 'duration' && c.grade === 'unverified')).toBe(true);
+  });
+
+  it('근거 없는 수치는 여전히 막는다', () => {
+    const text = '회의 시간을 30% 줄였습니다. 도입한 팀들의 만족도가 높습니다. 지금 시작하세요.';
+    const r = assure({ text, claims: registerClaims(text, facts), citations: [] });
+    expect(r.verdict).toBe('BLOCK');
+  });
+});

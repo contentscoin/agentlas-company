@@ -23,13 +23,57 @@
 export const CLAIM_PATTERNS: ReadonlyArray<{ kind: ClaimKind; re: RegExp }> = [
   // 숫자로 된 크기 주장. 활용형이 다양해(빠릅니다·빨라졌다) 서술어로 좁히면
   // 대부분을 놓치므로 숫자 자체를 대상으로 본다.
-  { kind: 'quantity', re: /\d[\d,.]*\s*(?:배|%|퍼센트|원|건|명|시간|분)/g },
+  // 만·억·조를 사이에 허용한다. 이것이 없어서 `500만원`·`3억 원`·`1,200만 명`
+  // 이 전부 빠져나갔다 — 한국어 사업 문서의 금액·수량은 대부분 이 형태다.
+  // 차단 대상 종류라 놓치면 근거 없는 금액 주장이 그대로 발행된다.
+  { kind: 'quantity', re: /\d[\d,.]*\s*(?:[만억조]\s*)?(?:배|%|퍼센트|원|건|명)/g },
+  // 시간 단위는 따로 뺐다. 실측에서 이 단위의 유일한 검출이 점검 공지의
+  // "총 2시간" 이었고, 그것 때문에 서비스 점검 안내가 BLOCK 됐다.
+  // 성과 주장일 수도 있으므로 버리지 않고 **권고**로 돌린다 (아래 참조).
+  { kind: 'duration', re: /\d[\d,.]*\s*(?:초|분|시간|일|주|개월|년)(?![가-힣])/g },
   { kind: 'superlative', re: /(?:업계|국내|세계|시장)\s*(?:1위|최초|최고|유일)/g },
+  // 접두어 없는 최상급·선도 주장. Task 11.4 에서 실측 후 추가했다.
+  // **뒤따르는 형태를 요구한다** — `최고치`·`최고급`·`최적화`·`최소한` 같은
+  // 일상어를 잡지 않기 위해서다.
+  {
+    kind: 'superlative-bare',
+    re: /(?:선도(?:하|적|합|해)|(?:최고|최상)(?:의|\s*수준)|유일한|독보적|1\s*위)/g,
+  },
   { kind: 'medical', re: /(?:완치|치료|의학적으로\s*입증|부작용\s*없)/g },
   { kind: 'comparative', re: /(?:경쟁사|타사|기존)\s*(?:대비|보다)/g },
 ];
 
-export type ClaimKind = 'quantity' | 'superlative' | 'medical' | 'comparative';
+/**
+ * 검출하되 **발행을 막지는 않는** 주장 종류 (R11.3, R11.5).
+ *
+ * Task 11.4 에서 실좌석 산출물 14편(5,379자)을 재고 정했다. 근거는 셋이다.
+ *
+ * 1. **정규식이 다짐과 단언을 못 가른다.** 코퍼스의 유일한 선도 표현은
+ *    "업계를 선도하는 기준이 **되겠습니다**" 였다 — 현재 상태 주장이 아니라
+ *    포부다. 막을 근거가 없다.
+ * 2. **지시문 되울림이 걸린다.** "최고 수준을 내세우는 브랜드…" 는 좌석이
+ *    내 브리프를 그대로 되읊은 것이다. 어떤 패턴을 써도 이 형태는 잡힌다.
+ * 3. **시간 단위는 실측에서 오탐이 100%였다.** 유일한 검출이 점검 공지의
+ *    "총 2시간" 이었고 그 때문에 안내문이 BLOCK 됐다. 막으면 사람들은
+ *    검증을 끄게 되고, 끈 검증은 없는 검증이다.
+ *
+ * 권고는 **버리는 것이 아니다.** 클레임으로 등록되고(R11.1) 미검증으로
+ * 표시되며(R11.2) 발견으로 보고된다(R11.3). 자동 차단만 하지 않는다 —
+ * 모순 후보를 다루는 방식과 같은 규율이다.
+ */
+export const ADVISORY_KINDS: readonly ClaimKind[] = ['superlative-bare', 'duration'];
+
+export function isAdvisory(kind: ClaimKind): boolean {
+  return ADVISORY_KINDS.includes(kind);
+}
+
+export type ClaimKind =
+  | 'quantity'
+  | 'duration'
+  | 'superlative'
+  | 'superlative-bare'
+  | 'medical'
+  | 'comparative';
 export type EvidenceGrade = 'pack-citation' | 'measured' | 'unverified';
 
 export interface Claim {
@@ -56,17 +100,43 @@ export interface EvidenceSources {
  * 겹치는 자리는 각각 등록한다 — "업계 1위" 와 그 안의 숫자는 서로 다른
  * 종류의 주장이고, 근거도 다를 수 있다.
  */
+/**
+ * 날짜를 같은 길이의 공백으로 가린다.
+ *
+ * `2026년 8월 3일` 이 기간 주장으로 잡혔다 — 점검 공지의 일시였다. 날짜는
+ * 어떤 종류의 주장도 아니므로 패턴이 닿기 전에 지운다.
+ *
+ * **길이를 보존한다.** 클레임은 위치(`index`)를 들고 다니고 사람이 그것으로
+ * 원문을 찾아간다. 길이가 바뀌면 그 위치가 어긋난다.
+ */
+export function maskDates(text: string): string {
+  const DATE =
+    /\d{4}\s*년(?:\s*\d{1,2}\s*월)?(?:\s*\d{1,2}\s*일)?|\d{1,2}\s*월\s*\d{1,2}\s*일|\d{4}-\d{2}-\d{2}/g;
+  return text.replace(DATE, (m) => ' '.repeat(m.length));
+}
+
 export function extractClaims(text: string): Array<Omit<Claim, 'grade' | 'evidence'>> {
   const out: Array<Omit<Claim, 'grade' | 'evidence'>> = [];
+  const scanned = maskDates(text);
   for (const { kind, re } of CLAIM_PATTERNS) {
     const rx = new RegExp(re.source, re.flags);
     let m: RegExpExecArray | null;
-    while ((m = rx.exec(text)) !== null) {
+    while ((m = rx.exec(scanned)) !== null) {
       out.push({ text: m[0], kind, index: m.index });
       if (m.index === rx.lastIndex) rx.lastIndex += 1;
     }
   }
-  return out.sort((a, b) => a.index - b.index);
+  // 접두어 있는 최상급이 잡은 자리를 접두어 없는 패턴이 다시 잡는다 —
+  // `업계 1위` 안에 `1위` 가 들어 있다. 같은 주장이 두 번 등록되고, 게다가
+  // 한쪽은 차단이고 한쪽은 권고라 판정이 갈린다. 안쪽 것을 버린다.
+  const prefixed = out.filter((c) => c.kind === 'superlative');
+  const deduped = out.filter(
+    (c) =>
+      c.kind !== 'superlative-bare' ||
+      !prefixed.some((p) => c.index >= p.index && c.index + c.text.length <= p.index + p.text.length),
+  );
+
+  return deduped.sort((a, b) => a.index - b.index);
 }
 
 /** 클레임이 있는 줄. 근접성 판정의 단위다. */
