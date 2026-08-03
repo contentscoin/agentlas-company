@@ -61,6 +61,7 @@ import {
   seiBin,
 } from './assurance/sei.js';
 import { MetricsBroker } from './metrics/broker.js';
+import { MetricsStore } from './metrics/store.js';
 import { ThreadsMetricsAdapter } from './metrics/adapters/threads.js';
 import { SmartstoreMetricsAdapter } from './metrics/adapters/smartstore.js';
 import { isChannel } from './verbs/types.js';
@@ -390,9 +391,14 @@ function cmdCaps(argv: string[]): number {
  * 한 곳에 두는 이유는 어댑터가 늘 때 한 군데만 고치기 위해서다 — 갈라 두면
  * `company metrics` 로는 읽히는 채널이 복기에서는 안 읽히는 일이 생긴다.
  */
+function metricsStore(): MetricsStore {
+  return new MetricsStore({ file: join(resolveState(), 'metrics', 'records.json') });
+}
+
 function metricsBroker(ledger: Ledger, opts: { statsUrl?: string } = {}): MetricsBroker {
   return new MetricsBroker({
     ledger,
+    store: metricsStore(),
     adapters: [
       new ThreadsMetricsAdapter(),
       new SmartstoreMetricsAdapter({
@@ -917,6 +923,7 @@ async function cmdOffice(argv: string[]): Promise<number> {
     // 등록된 기기가 하나도 없으면 전부 거부하는 검증기를 쓴다. 자리표시자가
     // 통과시키던 자리를 거부가 대신한다 (Task 8.1).
     stepUp: enrolledAny ? totp : new RefuseAllStepUp(),
+    metricsStore: metricsStore(),
     host,
     port,
   });
@@ -1522,6 +1529,23 @@ async function cmdRetro(argv: string[]): Promise<number> {
 
   const hypotheses = causeHypotheses(retro);
   const proposal = proposeEdits({ source, retro, stepId: step.id, file });
+
+  // 화면이 다시 볼 수 있게 남긴다. 원장에는 요약만 가므로 여기 없으면
+  // 복기 결과가 터미널에서 사라진다.
+  metricsStore().recordRetro({
+    at: new Date().toISOString(),
+    runId,
+    subject: step.subject,
+    gaps: retro.gaps.map((g) => ({
+      metric: g.metric,
+      expected: g.expected,
+      actual: g.actual,
+      ratio: g.ratio,
+    })),
+    uncollected: retro.uncollected,
+    amendments: retro.amendments,
+    editCount: proposal.edits.length,
+  });
 
   ledger.append({
     actor: { kind: 'system', id: 'retro' },

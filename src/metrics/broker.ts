@@ -17,6 +17,7 @@ import type { Ledger } from '../ledger/ledger.js';
 import type { Channel } from '../verbs/types.js';
 import { foldOrders, toAggregate } from '../publish/aggregate.js';
 import { describeFinding, lint } from '../zones/lint.js';
+import type { MetricsStore } from './store.js';
 import type {
   MetricsAdapter,
   MetricsOutcome,
@@ -27,6 +28,13 @@ import type {
 export interface MetricsBrokerOptions {
   ledger: Ledger;
   adapters: MetricsAdapter[];
+  /**
+   * 측정 기록 보관소. 없으면 값이 호출자에게만 가고 사라진다.
+   *
+   * 원장에는 요약과 digest 만 남으므로(R9) 값을 다시 보려면 여기 있어야
+   * 한다. 담기는 것은 이미 경계를 넘은 집계값뿐이다 (`store.ts` 주석 참조).
+   */
+  store?: MetricsStore;
 }
 
 /**
@@ -43,10 +51,12 @@ export function foldRaw(raw: unknown): { aggregate: MetricsResult['aggregate']; 
 export class MetricsBroker {
   private readonly ledger: Ledger;
   private readonly byChannel: Map<Channel, MetricsAdapter>;
+  private readonly store: MetricsStore | undefined;
 
   constructor(opts: MetricsBrokerOptions) {
     this.ledger = opts.ledger;
     this.byChannel = new Map(opts.adapters.map((a) => [a.channel, a]));
+    this.store = opts.store;
   }
 
   /** 이 채널이 낼 수 있는 지표 이름. 복기가 무엇을 기대할지 정하는 데 쓴다. */
@@ -67,6 +77,16 @@ export class MetricsBroker {
 
     const ready = adapter.ready();
     if (!ready.ok) {
+      // 설정 미비도 기록한다. "토큰이 없어서 못 읽고 있다" 는 오너가 화면에서
+      // 봐야 하는 측정 건강 상태이고, 빼면 그 채널이 화면에서 그냥 사라진다.
+      this.store?.recordCollection({
+        at: new Date().toISOString(),
+        channel,
+        window,
+        ok: false,
+        reason: 'not-configured',
+        detail: ready.reason,
+      });
       return { ok: false, reason: 'not-configured', detail: ready.reason, checklist: ready.checklist };
     }
 
@@ -76,6 +96,16 @@ export class MetricsBroker {
         actor: { kind: 'system', id: 'metrics' },
         kind: 'deny',
         summary: `${channel} 지표 수집 실패 — ${read.detail}`,
+      });
+      // 실패도 남긴다. 남기지 않으면 화면에서 "측정이 고장 났다" 와
+      // "측정할 일이 없었다" 가 구분되지 않는다.
+      this.store?.recordCollection({
+        at: new Date().toISOString(),
+        channel,
+        window,
+        ok: false,
+        reason: 'adapter-failed',
+        detail: read.detail,
       });
       return { ok: false, reason: 'adapter-failed', detail: read.detail, checklist: read.checklist };
     }
@@ -108,6 +138,17 @@ export class MetricsBroker {
         (flagged.length > 0 ? `, 린트로 메모 ${flagged.length}건 폐기` : ''),
       // 이름과 위치만 남긴다. 값은 원장에 들어가지 않는다 (R15.6).
       evidence: [...dropped.map((d) => `dropped:${d}`), ...flagged],
+    });
+
+    this.store?.recordCollection({
+      at: new Date().toISOString(),
+      channel,
+      window,
+      ok: true,
+      aggregate,
+      // 이름만이다. 값은 여기에도 들어가지 않는다.
+      dropped,
+      uncollected,
     });
 
     return {

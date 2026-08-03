@@ -438,3 +438,16 @@ describe('원장 수명주기 표시는 해시가 덮는다', () => {
     expect(hashEvent(tampered)).not.toBe(e.hash);
   });
 });
+
+describe('측정 화면 (R11.6)', () => {
+  it('보관소가 없으면 빈 것이 아니라 안 켰다고 말한다', async () => {
+    // 이 시험의 서버는 metricsStore 없이 뜬다.
+    const body = await (await call('/api/measurements')).json();
+    expect(body.configured).toBe(false);
+    expect(body.collections).toEqual([]);
+  });
+
+  it('토큰 없이는 못 본다', async () => {
+    expect((await fetch(`${base}/api/measurements`)).status).toBe(401);
+  });
+});

@@ -25,6 +25,7 @@ import { assertBindable } from './bind.js';
 import type { DeviceRecord, DeviceStore } from './tokens.js';
 import type { StepUpVerifier } from './stepup.js';
 import { CONSOLE_HTML } from './console.js';
+import type { MetricsStore } from '../metrics/store.js';
 
 export interface OfficeServerOptions {
   ledger: Ledger;
@@ -36,6 +37,14 @@ export interface OfficeServerOptions {
   port?: number;
   /** SSE 폴링 간격. 원장은 파일이라 변경 통지가 없어 짧게 다시 읽는다. */
   pollMs?: number;
+  /**
+   * 측정 기록 보관소. 없으면 지표·복기 화면이 "기록 안 켬" 으로 보인다.
+   *
+   * 선택으로 둔 이유는 오피스 서버가 측정 없이도 돌아야 하기 때문이고,
+   * **없는 것을 빈 것으로 보이게 하지 않는다** — 측정한 적이 없는 것과
+   * 기록을 안 켠 것은 다른 사실이다.
+   */
+  metricsStore?: MetricsStore;
 }
 
 interface Ctx {
@@ -207,6 +216,8 @@ export class OfficeServer {
         return this.setCapability(ctx);
       case route === 'POST /api/panic':
         return this.panic(ctx);
+      case route === 'GET /api/measurements':
+        return this.getMeasurements(ctx);
       case route === 'GET /api/devices':
         return json(res, 200, { devices: this.opts.devices.list() });
       default:
@@ -288,6 +299,28 @@ export class OfficeServer {
       });
     }
     return out;
+  }
+
+  /**
+   * 측정 기록 — 지표 수집과 복기 (R11.6).
+   *
+   * 원장에는 요약과 digest 만 남으므로 값은 별도 보관소에서 온다. 보관소가
+   * 없으면 **빈 목록이 아니라 없다고 말한다** — 측정한 적이 없는 것과 기록을
+   * 안 켠 것은 다른 사실이다.
+   */
+  private getMeasurements(ctx: Ctx): void {
+    const store = this.opts.metricsStore;
+    if (!store) {
+      json(ctx.res, 200, { configured: false, collections: [], retros: [] });
+      return;
+    }
+    const all = store.read();
+    json(ctx.res, 200, {
+      configured: true,
+      latest: store.latestByChannel(),
+      collections: all.collections.slice(0, 30),
+      retros: all.retros.slice(0, 20),
+    });
   }
 
   private getHistory(ctx: Ctx): void {

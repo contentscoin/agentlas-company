@@ -108,9 +108,11 @@ export function proposeAmendments(
   const out: string[] = [];
 
   if (uncollected.length > 0) {
+    // 예전 문구는 "read_metrics 어댑터가 없으면" 이었는데 그 어댑터는 생겼다
+    // (Task 18.2). 이미 있는 것을 만들라고 보내는 안내였다.
     out.push(
       `먼저 측정을 고치세요 — ${uncollected.join(', ')} 을 수집하지 못했습니다. ` +
-        `${channel} read_metrics 어댑터가 없으면 복기는 반쪽입니다`,
+        `company metrics --channel ${channel} 로 수집 경로부터 확인하세요`,
     );
   }
 

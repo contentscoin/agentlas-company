@@ -193,6 +193,23 @@ export const CONSOLE_HTML = `<!doctype html>
   .ev .kind.publish { background: #24333a; color: var(--accent); }
   .ev .kind.tainted { background: #3a3324; color: var(--warn); }
   .ev .who { color: var(--muted); font-size: .74rem; }
+
+  h3 { font-size: .82rem; letter-spacing: .06em; text-transform: uppercase;
+       color: var(--muted); margin: 1.4rem 0 .6rem; font-weight: 700; }
+  h3:first-child { margin-top: 0; }
+
+  table.m { width: 100%; border-collapse: collapse; font-size: .87rem; }
+  table.m th {
+    text-align: right; font-weight: 600; color: var(--muted);
+    font-size: .72rem; padding: 0 0 .35rem; border-bottom: 1px solid var(--line);
+  }
+  table.m th:first-child { text-align: left; }
+  table.m td { padding: .4rem 0; border-bottom: 1px solid var(--line); text-align: right; }
+  table.m td:first-child { text-align: left; }
+  table.m tr:last-child td { border-bottom: 0; }
+  .miss { color: var(--muted); }
+  .off { color: var(--warn); }
+  .fail { color: var(--danger); }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
@@ -217,12 +234,14 @@ export const CONSOLE_HTML = `<!doctype html>
     <nav class="tabs" role="tablist">
       <button role="tab" class="tab on" data-view="approvals">승인 <span class="badge" id="b-appr"></span></button>
       <button role="tab" class="tab" data-view="runs">실행 <span class="badge" id="b-runs"></span></button>
+      <button role="tab" class="tab" data-view="measure">측정</button>
       <button role="tab" class="tab" data-view="ledger">원장</button>
     </nav>
 
     <div id="msg"></div>
     <div id="list"></div>
     <div id="runs" class="hidden"></div>
+    <div id="measure" class="hidden"></div>
     <div id="ledger" class="hidden"></div>
     <div class="foot">
       <button class="panic" id="panic">전체 차단 — 모든 능력 스위치를 끕니다</button>
@@ -244,6 +263,7 @@ export const CONSOLE_HTML = `<!doctype html>
   var events = [];      // 최신 우선
   var lastSeq = 0;
   var view = 'approvals';
+  var measure = null;   // null = 아직 안 읽음
   var MAX_EVENTS = 300; // 폰에서 무한히 쌓지 않는다
 
   // 주소창 조각(#token=…)으로 한 번에 넣을 수 있게 한다. 조각은 서버로
@@ -400,6 +420,102 @@ export const CONSOLE_HTML = `<!doctype html>
       '<p class="sub">원장에는 본문이 없습니다. 남는 것은 요약과 digest 뿐입니다.</p>';
   }
 
+  /** 지표 한 건. 값은 있고, 못 잰 것은 0 이 아니라 "못 잼" 으로 적는다. */
+  function collectionCard(c) {
+    if (!c.ok) {
+      return (
+        '<div class="card">' +
+          '<div class="row"><span class="action mono">' + esc(c.channel) + '</span>' +
+          '<span class="tag">수집 실패</span></div>' +
+          '<p class="summary fail">' + esc(c.detail) + '</p>' +
+          '<p class="sub">' + esc(clock(c.at)) + ' · ' + esc(c.window.from) + ' ~ ' + esc(c.window.to) + '</p>' +
+        '</div>'
+      );
+    }
+    var keys = Object.keys(c.aggregate || {});
+    var rows = keys.map(function (k) {
+      return '<tr><td class="mono">' + esc(k) + '</td><td class="mono">' +
+        esc(String(c.aggregate[k])) + '</td></tr>';
+    }).join('');
+    var missing = (c.uncollected || []).map(function (k) {
+      return '<tr><td class="mono miss">' + esc(k) + '</td><td class="miss">못 잼</td></tr>';
+    }).join('');
+    return (
+      '<div class="card">' +
+        '<div class="row"><span class="action mono">' + esc(c.channel) + '</span></div>' +
+        '<p class="sub">' + esc(clock(c.at)) + ' · ' + esc(c.window.from) + ' ~ ' + esc(c.window.to) + '</p>' +
+        (keys.length || missing
+          ? '<table class="m">' + rows + missing + '</table>'
+          : '<p class="summary miss">수집된 지표 없음</p>') +
+        ((c.dropped || []).length
+          ? '<div class="digest"><b>경계에서 차단</b> ' + esc(c.dropped.join(', ')) +
+            ' — 이름만 남습니다. 값은 좌석으로 넘어가지 않았습니다</div>'
+          : '') +
+      '</div>'
+    );
+  }
+
+  function retroCard(r) {
+    var rows = (r.gaps || []).map(function (g) {
+      var actual = g.actual === null ? '<span class="miss">못 잼</span>' : esc(String(g.actual));
+      var ratio = g.ratio === null ? '<span class="miss">—</span>'
+        : '<span class="' + (g.ratio < 0.5 || g.ratio > 2 ? 'off' : '') + '">' +
+          Math.round(g.ratio * 100) + '%</span>';
+      return '<tr><td class="mono">' + esc(g.metric) + '</td><td class="mono">' +
+        esc(String(g.expected)) + '</td><td class="mono">' + actual + '</td><td class="mono">' + ratio + '</td></tr>';
+    }).join('');
+    return (
+      '<div class="card">' +
+        '<div class="row"><span class="action">' + esc(r.subject) + '</span>' +
+          (r.uncollected && r.uncollected.length
+            ? '<span class="tag">미수집 ' + r.uncollected.length + '</span>' : '') +
+        '</div>' +
+        '<p class="sub">' + esc(clock(r.at)) + '</p>' +
+        '<table class="m"><tr><th>지표</th><th>예측</th><th>실제</th><th>비율</th></tr>' + rows + '</table>' +
+        (r.amendments || []).map(function (a) {
+          return '<p class="sub">' + esc(a) + '</p>';
+        }).join('') +
+        (r.editCount
+          ? '<div class="digest"><b>레시피 편집 제안 ' + r.editCount + '건</b> — ' +
+            'company retro 로 diff 를 받아 적용은 직접 하세요</div>'
+          : '') +
+      '</div>'
+    );
+  }
+
+  function renderMeasure() {
+    var el = $('measure');
+    if (measure === null) { el.innerHTML = '<div class="empty">읽는 중…</div>'; return; }
+    if (!measure.configured) {
+      el.innerHTML =
+        '<div class="empty"><div class="big">측정 기록이 켜져 있지 않습니다</div>' +
+        '<div>기록 없이도 수집은 됩니다. 다만 지난 값을 여기서 볼 수 없습니다.</div></div>';
+      return;
+    }
+    var latest = measure.latest || [];
+    var retros = measure.retros || [];
+    var html = '<h3>채널별 최근 수집</h3>';
+    html += latest.length
+      ? latest.map(collectionCard).join('')
+      : '<div class="empty"><div class="big">수집 기록이 없습니다</div>' +
+        '<div>아직 지표를 한 번도 읽지 않았습니다.</div></div>';
+    html += '<h3>복기</h3>';
+    html += retros.length
+      ? retros.map(retroCard).join('')
+      : '<div class="empty"><div class="big">복기 기록이 없습니다</div>' +
+        '<div>예측을 등록한 실행이 복기되면 여기 쌓입니다.</div></div>';
+    html += '<p class="sub">값은 집계값입니다. 원본 레코드는 좌석으로도 여기로도 넘어오지 않습니다.</p>';
+    el.innerHTML = html;
+  }
+
+  function loadMeasure() {
+    return api('/api/measurements').then(function (r) {
+      if (r.status !== 200) return;
+      measure = r.body || { configured: false };
+      if (view === 'measure') renderMeasure();
+    });
+  }
+
   function paint() {
     $('b-appr').textContent = cards.length ? String(cards.length) : '';
     $('b-runs').textContent = runs.length ? String(runs.length) : '';
@@ -412,6 +528,11 @@ export const CONSOLE_HTML = `<!doctype html>
       $('title').textContent = '실행';
       meta.textContent = runs.length ? runs.length + '건 진행 중' : '진행 중 없음';
       renderRuns();
+    } else if (view === 'measure') {
+      $('title').textContent = '측정';
+      var n = measure && measure.latest ? measure.latest.length : 0;
+      meta.textContent = n ? n + '개 채널' : '기록 없음';
+      renderMeasure();
     } else {
       $('title').textContent = '원장';
       meta.textContent = lastSeq ? '#' + lastSeq + ' 까지' : '기록 없음';
@@ -421,7 +542,8 @@ export const CONSOLE_HTML = `<!doctype html>
 
   function switchTo(next) {
     view = next;
-    ['approvals', 'runs', 'ledger'].forEach(function (v) {
+    if (next === 'measure' && measure === null) loadMeasure();
+    ['approvals', 'runs', 'measure', 'ledger'].forEach(function (v) {
       var pane = $(v === 'approvals' ? 'list' : v);
       pane.classList.toggle('hidden', v !== next);
     });
@@ -455,7 +577,11 @@ export const CONSOLE_HTML = `<!doctype html>
       if (r.status === 401) { lock('토큰이 유효하지 않습니다'); return; }
       cards = (r.body && r.body.pending) || [];
       paint();
-      return loadState();
+      return loadState().then(function () {
+        // 수집·복기는 원장에 흔적을 남긴다. 원장이 움직였으면 측정도 다시 읽는다.
+        if (measure !== null) return loadMeasure();
+        return undefined;
+      });
     });
   }
 
