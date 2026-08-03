@@ -46,7 +46,7 @@ import { Studio } from '../studio/studio.js';
 import { SLOT_KINDS, type Slot, type SlotKind } from '../studio/artifact.js';
 import type { BrandPack } from '../studio/brandpack.js';
 import { extractCitations, registerClaims } from '../assurance/claims.js';
-import { assure } from '../assurance/checks.js';
+import { assure, describeFinding as describeAssuranceFinding } from '../assurance/checks.js';
 
 export interface EngineOptions {
   ledger: Ledger;
@@ -525,7 +525,10 @@ export class RecipeEngine {
           brandPass: artifact.brandPass === true,
           brandNotes: artifact.brandNotes,
           verdict: assurance.verdict,
-          assuranceNotes: assurance.findings.map((f) => f.detail),
+          // 공용 렌더러를 쓴다. `f.detail` 만 쓰면 위치가 빠져서, 같은 주장이
+          // 본문에 두 번 나올 때 똑같은 줄이 두 번 찍힌 것처럼 보인다 —
+          // 실제로 그렇게 보였고 중복 버그로 오해했다.
+          assuranceNotes: assurance.findings.map(describeAssuranceFinding),
           packless: packLoad.packless,
         };
 
