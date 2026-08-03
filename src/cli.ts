@@ -51,6 +51,8 @@ import { checkHealth } from './ops/health.js';
 import { detectAnomalies, describeAnomaly, unreadableLedger } from './ops/anomaly.js';
 import { buildDigest, renderDigest } from './ops/digest.js';
 import { registerClaims, describeClaim, extractCitations } from './assurance/claims.js';
+import { compare, noPrediction, renderRetro, type Observed } from './assurance/retro.js';
+import { causeHypotheses, proposeEdits } from './assurance/amend.js';
 import {
   SEI_BIN_ENV,
   SEI_NOT_FOR_TEXT,
@@ -70,6 +72,7 @@ import { randomUUID } from 'node:crypto';
 import { Meeting } from './org/meeting.js';
 import { RecipeEngine } from './recipes/engine.js';
 import { loadRecipe } from './recipes/load.js';
+import type { Recipe, RetroStep } from './recipes/types.js';
 import { currentPlatform, emitForPlatform, parseSchedule } from './recipes/schedule.js';
 
 const EXIT_OK = 0;
@@ -381,6 +384,25 @@ function cmdCaps(argv: string[]): number {
 }
 
 /** 레시피 실행에 필요한 것을 한 번에 조립한다. */
+/**
+ * 지표 브로커. 세 곳(레시피 엔진·metrics·retro)이 같은 어댑터 묶음을 쓴다.
+ *
+ * 한 곳에 두는 이유는 어댑터가 늘 때 한 군데만 고치기 위해서다 — 갈라 두면
+ * `company metrics` 로는 읽히는 채널이 복기에서는 안 읽히는 일이 생긴다.
+ */
+function metricsBroker(ledger: Ledger, opts: { statsUrl?: string } = {}): MetricsBroker {
+  return new MetricsBroker({
+    ledger,
+    adapters: [
+      new ThreadsMetricsAdapter(),
+      new SmartstoreMetricsAdapter({
+        hands: new HandsExecutor({ ledger }),
+        ...(opts.statsUrl ? { statsUrl: opts.statsUrl } : {}),
+      }),
+    ],
+  });
+}
+
 function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalService } {
   const { policy } = loadPolicy(policyFile(argv));
   const ledger = Ledger.open(ledgerPath(argv));
@@ -407,12 +429,8 @@ function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalS
   });
   // 지표 브로커도 함께 물린다. 없으면 복기가 실측 없이 돌고, 그 사실이
   // 복기 제안 맨 위에 올라간다.
-  const metrics = new MetricsBroker({
-    ledger,
-    adapters: [
-      new ThreadsMetricsAdapter(),
-      new SmartstoreMetricsAdapter({ hands: new HandsExecutor({ ledger }) }),
-    ],
+  const metrics = metricsBroker(ledger, {
+    ...(flagValue(argv, '--stats-url') ? { statsUrl: flagValue(argv, '--stats-url') as string } : {}),
   });
   const engine = new RecipeEngine({
     ledger,
@@ -1407,6 +1425,145 @@ function cmdOps(argv: string[]): number {
  * 막힌다 (R11.5) — 이 명령은 그 판정을 미리 보는 자리다.
  */
 /**
+ * 복기 (R11.6, R11.7).
+ *
+ * 레시피 실행 하나를 골라 **예측과 실제를 나란히 놓고**, 원인 가설과
+ * **적용 가능한 레시피 diff** 를 낸다.
+ *
+ * 레시피 안의 `retro` 스텝과 다른 점은 시점이다. 스텝은 실행 중에 돌아
+ * 그 자리의 숫자를 보고, 이 명령은 며칠 뒤에 다시 불러 그때의 숫자를 본다 —
+ * `afterDays` 가 있는 이유가 그것이다.
+ *
+ * **diff 를 적용하지 않는다.** 레시피가 스스로를 고치기 시작하면 원장에
+ * 남는 것은 결과뿐이고 누가 왜 바꿨는지가 사라진다.
+ */
+async function cmdRetro(argv: string[]): Promise<number> {
+  const runId = flagValue(argv, '--run') ?? subcommand(argv);
+  const file = flagValue(argv, '--recipe');
+  if (!runId || !file) {
+    process.stderr.write(
+      '사용법: company retro --run <실행ID> --recipe <레시피.yaml> [--step <스텝ID>]\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  const ledger = Ledger.open(ledgerPath(argv));
+  const { engine } = engineFor(argv);
+  const state = engine.loadRun(runId);
+  if (!state) {
+    process.stderr.write(`실행 ${runId} 을 찾을 수 없습니다\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  let recipe: Recipe;
+  let source: string;
+  try {
+    recipe = loadRecipe(file);
+    source = readFileSync(file, 'utf8');
+  } catch (err) {
+    process.stderr.write(`레시피를 읽지 못했습니다: ${(err as Error).message}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const wanted = flagValue(argv, '--step');
+  const step = recipe.steps.find(
+    (x): x is RetroStep => x.kind === 'retro' && (wanted === undefined || x.id === wanted),
+  );
+  if (!step) {
+    process.stderr.write(
+      `레시피에 retro 스텝이 없습니다${wanted ? ` (--step ${wanted})` : ''}\n`,
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  // 예측이 없으면 복기가 아니다 (R11.6).
+  if (!step.expect || Object.keys(step.expect).length === 0) {
+    const skipped = noPrediction(runId, step.subject);
+    for (const line of renderRetro(skipped)) out(line);
+    return EXIT_FINDING;
+  }
+
+  // 실측을 지금 다시 읽는다. 스텝이 실행 중에 본 숫자가 아니라 오늘의 숫자다.
+  const metrics = metricsBroker(ledger, {
+    ...(flagValue(argv, '--stats-url') ? { statsUrl: flagValue(argv, '--stats-url') as string } : {}),
+  });
+  const today = new Date().toISOString().slice(0, 10);
+  let observed: Observed | null = null;
+  let why: string | null = null;
+  if (!step.channel) {
+    why = '채널 미지정 — 실측 없이 복기';
+  } else if (!isChannel(step.channel)) {
+    why = `${step.channel} 은 알 수 없는 채널`;
+  } else {
+    const outcome = await metrics.read(step.channel, {
+      from: flagValue(argv, '--from') ?? step.from ?? today,
+      to: flagValue(argv, '--to') ?? step.to ?? today,
+    });
+    if (!outcome.ok) why = `지표 수집 실패 — ${outcome.detail}`;
+    else {
+      const actual: Record<string, number> = {};
+      for (const [k, v] of Object.entries(outcome.result.aggregate)) {
+        if (typeof v === 'number') actual[k] = v;
+      }
+      observed = { runId, actual, at: new Date().toISOString() };
+    }
+  }
+
+  const retro = compare(
+    {
+      runId,
+      channel: step.channel ?? step.subject,
+      expected: step.expect,
+      afterDays: step.afterDays,
+      at: new Date().toISOString(),
+    },
+    observed,
+  );
+
+  const hypotheses = causeHypotheses(retro);
+  const proposal = proposeEdits({ source, retro, stepId: step.id, file });
+
+  ledger.append({
+    actor: { kind: 'system', id: 'retro' },
+    kind: 'retro',
+    runId,
+    summary:
+      `복기 ${recipe.name}/${step.id} — 지표 ${retro.gaps.length}건, ` +
+      `수집 못 함 ${retro.uncollected.length}건, 편집 제안 ${proposal.edits.length}건` +
+      (why ? ` (${why})` : ''),
+  });
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut({ retro, hypotheses, proposal, ...(why ? { measurement: why } : {}) });
+    return retro.uncollected.length > 0 || proposal.edits.length > 0 ? EXIT_FINDING : EXIT_OK;
+  }
+
+  for (const line of renderRetro(retro)) out(line);
+  if (why) out(`  (${why})`);
+  out('');
+  out('원인 가설:');
+  for (const h of hypotheses) out(`  ${h}`);
+
+  if (proposal.notes.length > 0) {
+    out('');
+    for (const n of proposal.notes) out(`  ${n}`);
+  }
+
+  out('');
+  if (proposal.edits.length === 0) {
+    out('레시피 diff: 제안할 편집이 없습니다');
+  } else {
+    out(`레시피 diff (${proposal.edits.length}건) — 적용은 오너가 합니다:`);
+    out('');
+    for (const line of proposal.diff.split('\n')) out(line);
+    out('');
+    for (const e of proposal.edits) out(`  ${e.path}:${e.line} — ${e.why}`);
+  }
+
+  return retro.uncollected.length > 0 || proposal.edits.length > 0 ? EXIT_FINDING : EXIT_OK;
+}
+
+/**
  * 프로젝트 위험 신호 (R11.3, R16.4).
  *
  * **설계가 SEI 에 있다고 가정한 균일 계약(0 성공 / 1 발견 / 2 실행 불가)을
@@ -1528,15 +1685,8 @@ async function cmdMetrics(argv: string[]): Promise<number> {
   }
 
   const ledger = Ledger.open(ledgerPath(argv));
-  const broker = new MetricsBroker({
-    ledger,
-    adapters: [
-      new ThreadsMetricsAdapter(),
-      new SmartstoreMetricsAdapter({
-        hands: new HandsExecutor({ ledger }),
-        ...(flagValue(argv, '--stats-url') ? { statsUrl: flagValue(argv, '--stats-url') as string } : {}),
-      }),
-    ],
+  const broker = metricsBroker(ledger, {
+    ...(flagValue(argv, '--stats-url') ? { statsUrl: flagValue(argv, '--stats-url') as string } : {}),
   });
 
   const today = new Date().toISOString().slice(0, 10);
@@ -1703,6 +1853,7 @@ function usage(): void {
   out('  지표 (R11.6, R7.6) — 좌석으로 넘어가는 것은 집계값뿐이다');
   out('  company metrics --channel smartstore [--from …] [--to …]');
   out('  company sei [--project <경로>]        프로젝트 위험 신호 (0 없음 / 1 있음 / 2 못 돌림)');
+  out('  company retro --run <실행ID> --recipe <레시피.yaml>');
   out('');
   out('  검증 (R11) — 클레임 등록과 결정론적 검사. BLOCK 은 발행을 막는다');
   out('  company assure <산출물.txt> [--facts <팩.json>]');
@@ -1769,6 +1920,8 @@ async function main(): Promise<number> {
         return cmdAssure(argv);
       case 'sei':
         return await cmdSei(argv);
+      case 'retro':
+        return await cmdRetro(argv);
       case 'metrics':
         return await cmdMetrics(argv);
       case 'approvals':

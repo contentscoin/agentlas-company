@@ -8,10 +8,9 @@
  * 복기가 아니라 소감이다. 그래서 예측을 먼저 등록하고, 등록되지 않은 실행은
  * 복기 대상이 아니라고 분명히 말한다 — 없는 예측을 지어내지 않는다.
  *
- * **지표 수집 경로는 아직 없다.** 채널별 `read_metrics` 동사는 정의돼 있으나
- * (`src/verbs/types.ts`) 그것을 실행하는 어댑터가 없다. 그래서 이 모듈은
- * 실측값을 **주입받고**, 주입되지 않으면 "수집 못 함" 으로 남긴다. 추정으로
- * 채우면 복기가 거짓말이 된다.
+ * **실측값은 주입받는다.** 수집은 `src/metrics/` 가 하고 이 모듈은 대조만
+ * 한다 — 이 모듈이 채널을 알면 새 채널마다 여기도 고쳐야 한다. 주입되지
+ * 않으면 "수집 못 함" 으로 남긴다. 추정으로 채우면 복기가 거짓말이 된다.
  */
 
 export interface Prediction {
@@ -164,11 +163,21 @@ export function renderRetro(r: Retro): string[] {
   if (r.skipped) {
     lines.push(`건너뜀: ${r.skipped}`);
   } else {
-    lines.push('지표      예측      실제      비율');
-    for (const g of r.gaps) {
-      const actual = g.actual === null ? '수집못함' : String(g.actual);
-      const ratio = g.ratio === null ? '—' : `${Math.round(g.ratio * 100)}%`;
-      lines.push(`${g.metric.padEnd(10)}${String(g.expected).padEnd(10)}${actual.padEnd(10)}${ratio}`);
+    // 폭을 내용에서 계산한다. 고정 10칸이면 `refundCount` 같은 이름이
+    // 값에 붙어 `refundCount3` 으로 보인다 — 실제로 그렇게 나왔다.
+    const w = (xs: string[]): number => Math.max(...xs.map((x) => x.length)) + 2;
+    const cells = r.gaps.map((g) => ({
+      metric: g.metric,
+      expected: String(g.expected),
+      actual: g.actual === null ? '수집못함' : String(g.actual),
+      ratio: g.ratio === null ? '—' : `${Math.round(g.ratio * 100)}%`,
+    }));
+    const wm = w([...cells.map((c) => c.metric), '지표']);
+    const we = w([...cells.map((c) => c.expected), '예측']);
+    const wa = w([...cells.map((c) => c.actual), '실제']);
+    lines.push(`${'지표'.padEnd(wm)}${'예측'.padEnd(we)}${'실제'.padEnd(wa)}비율`);
+    for (const c of cells) {
+      lines.push(`${c.metric.padEnd(wm)}${c.expected.padEnd(we)}${c.actual.padEnd(wa)}${c.ratio}`);
     }
   }
   lines.push('');
