@@ -172,6 +172,9 @@ describe('라이브오피스 (R10)', () => {
 });
 
 describe('승인 (R14.6, R14.7)', () => {
+  /** 화면이 표시했을 digest. 승인은 이 값에 묶인다 (R4.6). */
+  const DIGEST = 'd'.repeat(64);
+
   function card(level: 'L2' | 'L3'): string {
     return approvals.create({
       classification: {
@@ -183,18 +186,24 @@ describe('승인 (R14.6, R14.7)', () => {
         needsStepUp: level === 'L3',
         irreversible: level === 'L3',
       },
-      payloadDigest: 'd'.repeat(64),
+      payloadDigest: DIGEST,
       summary: '테스트',
     }).id;
   }
 
   it('L2 는 단계별 인증 없이 승인된다', async () => {
-    const res = await call(`/api/approvals/${card('L2')}/approve`, { method: 'POST', body: {} });
+    const res = await call(`/api/approvals/${card('L2')}/approve`, {
+      method: 'POST',
+      body: { digest: DIGEST },
+    });
     expect(res.status).toBe(200);
   });
 
   it('L3 은 단계별 인증 없이 승인되지 않는다 (R14.7)', async () => {
-    const res = await call(`/api/approvals/${card('L3')}/approve`, { method: 'POST', body: {} });
+    const res = await call(`/api/approvals/${card('L3')}/approve`, {
+      method: 'POST',
+      body: { digest: DIGEST },
+    });
     expect(res.status).toBe(403);
     expect((await res.json()).error).toBe('step-up-required');
   });
@@ -202,13 +211,16 @@ describe('승인 (R14.6, R14.7)', () => {
   it('기본 검증기는 전부 거부한다 — 등록 없이 L3 이 통과하지 않는다', async () => {
     const res = await call(`/api/approvals/${card('L3')}/approve`, {
       method: 'POST',
-      body: { stepUp: '123456' },
+      body: { digest: DIGEST, stepUp: '123456' },
     });
     expect(res.status).toBe(403);
   });
 
   it('L3 거부가 원장에 남는다', async () => {
-    await call(`/api/approvals/${card('L3')}/approve`, { method: 'POST', body: {} });
+    await call(`/api/approvals/${card('L3')}/approve`, {
+      method: 'POST',
+      body: { digest: DIGEST },
+    });
     const denies = ledger.query({ kind: 'deny' });
     expect(denies.some((e) => e.summary?.includes('단계별 인증 실패'))).toBe(true);
   });
@@ -221,7 +233,7 @@ describe('승인 (R14.6, R14.7)', () => {
     const code = totpCode(base32Decode(secret), Date.now());
     const res = await call(`/api/approvals/${card('L3')}/approve`, {
       method: 'POST',
-      body: { stepUp: code },
+      body: { digest: DIGEST, stepUp: code },
     });
     expect(res.status).toBe(200);
   });
@@ -234,15 +246,52 @@ describe('승인 (R14.6, R14.7)', () => {
     const code = totpCode(base32Decode(secret), Date.now());
     const first = await call(`/api/approvals/${card('L3')}/approve`, {
       method: 'POST',
-      body: { stepUp: code },
+      body: { digest: DIGEST, stepUp: code },
     });
     expect(first.status).toBe(200);
     const second = await call(`/api/approvals/${card('L3')}/approve`, {
       method: 'POST',
-      body: { stepUp: code },
+      body: { digest: DIGEST, stepUp: code },
     });
     expect(second.status).toBe(403);
   });
+
+  describe('승인은 화면에 보인 것에 묶인다 (R4.5, R4.6)', () => {
+    /**
+     * 처음에는 서버가 카드의 digest 를 꺼내 카드 자신과 비교했다. 승인자의
+     * 화면이 비교에 들어가지 않아 검사가 성립하지 않았다 — 콘솔을 만들면서
+     * 드러났다.
+     */
+    it('digest 없이 승인되지 않는다', async () => {
+      const res = await call(`/api/approvals/${card('L2')}/approve`, { method: 'POST', body: {} });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe('digest-required');
+    });
+
+    it('낡은 화면에서 누른 승인은 통과하지 않는다', async () => {
+      const id = card('L2');
+      // 화면이 표시했던 값과 다른 것을 보낸다 = 그 사이 대상이 바뀐 상황.
+      const res = await call(`/api/approvals/${id}/approve`, {
+        method: 'POST',
+        body: { digest: 'e'.repeat(64) },
+      });
+      expect(res.status).toBe(409);
+    });
+
+    it('거부는 digest 를 요구하지 않는다 — 아니오는 언제나 아니오다', async () => {
+      const res = await call(`/api/approvals/${card('L2')}/reject`, { method: 'POST', body: {} });
+      expect(res.status).toBe(200);
+    });
+
+    it('껍데기에 회사 정보가 들어 있지 않다', async () => {
+      // 승인 카드를 만들어 둔 상태에서도 화면 자체는 데이터를 담지 않는다.
+      card('L3');
+      const html = await (await fetch(`${base}/`)).text();
+      expect(html).not.toContain('publish.irreversible');
+      expect(html).not.toContain('d'.repeat(64));
+    });
+  });
+
 });
 
 describe('능력 스위치 (R14.8)', () => {
@@ -293,5 +342,26 @@ describe('바인딩 거부 (R14.2)', () => {
       host: '0.0.0.0',
     });
     await expect(bad.listen()).rejects.toThrow(/기동 거부/);
+  });
+});
+
+describe('콘솔 껍데기 (R14.4)', () => {
+  it('토큰 없이 화면을 받는다 — 첫 요청은 헤더를 실을 수 없다', async () => {
+    const res = await fetch(`${base}/`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    expect(await res.text()).toContain('승인');
+  });
+
+  it('데이터 경로는 여전히 토큰을 요구한다', async () => {
+    for (const path of ['/api/approvals', '/api/state', '/api/capabilities', '/api/devices']) {
+      const res = await fetch(`${base}${path}`);
+      expect(res.status, path).toBe(401);
+    }
+  });
+
+  it('질의 문자열 토큰은 SSE 에서만 통한다', async () => {
+    const res = await fetch(`${base}/api/approvals?token=${token}`);
+    expect(res.status).toBe(401);
   });
 });

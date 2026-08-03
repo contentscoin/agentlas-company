@@ -24,6 +24,7 @@ import { parseTtl } from '../capabilities/ttl.js';
 import { assertBindable } from './bind.js';
 import type { DeviceRecord, DeviceStore } from './tokens.js';
 import type { StepUpVerifier } from './stepup.js';
+import { CONSOLE_HTML } from './console.js';
 
 export interface OfficeServerOptions {
   ledger: Ledger;
@@ -141,9 +142,40 @@ export class OfficeServer {
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://office.invalid');
 
-    // 인증이 가장 앞이다. 토큰 없는 요청은 어떤 경로도 보지 못한다 (R14.3).
+    /**
+     * 콘솔 껍데기만 인증 앞에 선다 (R14.4).
+     *
+     * 브라우저의 첫 요청은 Bearer 토큰을 실을 방법이 없다. 오너가 폰에서
+     * 주소를 열었을 때 401 만 보면 토큰을 넣을 자리조차 없다.
+     *
+     * **여기서 나가는 것은 데이터가 아니라 화면이다.** 회사 정보가 한 글자도
+     * 들어 있지 않고, 이 응답이 알려 주는 사실은 "이 포트에 오피스 서버가 있다"
+     * 뿐이며 그것은 포트가 이미 알려 준다. `/api/*` 는 전부 인증 뒤에 남는다.
+     */
+    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        'referrer-policy': 'no-referrer',
+        // 우리 서버가 낸 화면만 돈다. 외부에서 무엇도 불러오지 않는다.
+        'content-security-policy':
+          "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; " +
+          "connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
+      });
+      res.end(CONSOLE_HTML);
+      return;
+    }
+
+    // 인증이 그다음이다. 토큰 없는 요청은 어떤 데이터 경로도 보지 못한다 (R14.3).
+    //
+    // SSE 만 질의 문자열 토큰을 받는다. `EventSource` 가 헤더를 싣지 못하기
+    // 때문이고, 다른 경로로 넓히지 않는다 — URL 에 실린 토큰은 기록에 남기
+    // 쉬우므로 실시간 갱신 하나를 위해서만 연다.
     const auth = req.headers.authorization ?? '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : undefined;
+    const header = auth.startsWith('Bearer ') ? auth.slice(7).trim() : undefined;
+    const isStream = req.method === 'GET' && url.pathname === '/api/events';
+    const token = header ?? (isStream ? (url.searchParams.get('token') ?? undefined) : undefined);
     const device = this.opts.devices.verify(token);
     if (!device) {
       json(res, 401, { error: 'device-token-required' });
@@ -338,10 +370,27 @@ export class OfficeServer {
       // L3 은 위에서 두 번째 요소를 검증하고 내려온 것만 여기 닿는다.
       stepUp: card.level === 'L3',
     };
-    const outcome =
-      action === 'approve'
-        ? this.opts.approvals.approve(id, submitter, card.payloadDigest)
-        : this.opts.approvals.reject(id, submitter, String(ctx.body.reason ?? '오너 거부'));
+    // **승인자가 본 것이 비교에 들어가야 한다 (R4.5, R4.6).**
+    //
+    // 처음에는 여기서 `card.payloadDigest` 를 그대로 넘겼다. 카드의 digest 를
+    // 카드 자신과 비교하는 것이라 검사가 성립하지 않았다 — 승인자의 화면은
+    // 어디에도 들어가지 않았다. 이제 호출자가 **자기가 표시한** digest 를
+    // 보내고, 그 사이 카드가 바뀌었으면 불일치로 걸린다. 폰에서 목록을 띄워
+    // 둔 채 시간이 지나는 상황이 정확히 이 경우다.
+    if (action === 'approve') {
+      const shown = typeof ctx.body.digest === 'string' ? ctx.body.digest : '';
+      if (shown === '') {
+        json(ctx.res, 400, { error: 'digest-required' });
+        return;
+      }
+      const outcome = this.opts.approvals.approve(id, submitter, shown);
+      json(ctx.res, outcome.ok ? 200 : 409, outcome);
+      return;
+    }
+
+    // 거부는 digest 를 요구하지 않는다. 낡은 화면에서 눌러도 "아니오" 는
+    // 아니오이고, 여기서 막으면 오너가 거부하지 못하는 상태가 생긴다.
+    const outcome = this.opts.approvals.reject(id, submitter, String(ctx.body.reason ?? '오너 거부'));
     json(ctx.res, outcome.ok ? 200 : 409, outcome);
   }
 
