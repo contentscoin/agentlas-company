@@ -19,6 +19,7 @@ import { SeatBroker } from './seats/broker.js';
 import { ALL_SEATS, effectiveConcurrency } from './seats/spec.js';
 import { distinctVendors, providerFor } from './seats/providers.js';
 import { createProfile } from './seats/profile.js';
+import { pathToFileURL } from 'node:url';
 import { resolveState } from './paths.js';
 import { CapabilityStore } from './capabilities/store.js';
 import { RISKY_CAPABILITIES, isRiskyCapability, type Caller } from './capabilities/types.js';
@@ -278,18 +279,128 @@ function capStore(argv: string[]): CapabilityStore {
 }
 
 /**
- * 오너 신원.
+ * CLI 의 단계별 인증 (R8, R15.8).
  *
- * CLI 의 `--step-up` 은 실물 단계별 인증의 자리표시자다.
- * 진짜 인증(기기 토큰 + 기기 잠금 해제)은 Task 14 의 콘솔·PWA 가 맡는다.
- * 지금 이것을 인증이라고 부르지 않는다.
+ * **예전에는 `--step-up` 이 값 없는 플래그였다.** 타이핑하는 것이 곧 인증이라
+ * 두 번째 요소가 아니었다. 오피스 API 는 Task 14 에서 TOTP 로 닫혔는데 CLI 는
+ * 그대로여서, 같은 구멍이 좁아진 채로 남아 있었다.
+ *
+ * 이제 코드를 받는다. `--step-up 123456` 처럼 쓰고, 오피스에 등록한 기기의
+ * 코드를 그대로 넣는다 — TOTP 는 시크릿 소지를 증명하는 것이므로 코드를 어디에
+ * 입력하는지는 상관이 없다.
+ *
+ * **값 없는 `--step-up` 은 통과가 아니라 실패다.** 조용히 예전처럼 통과시키면
+ * 고친 의미가 없고, 예전 스크립트는 소리 내며 멈춰야 한다.
+ *
+ * 코드 하나는 승인 하나다 — 검증기가 사용한 창을 기록하므로 폰에서 쓴 코드를
+ * CLI 에서 다시 쓸 수 없다. 그것이 재사용 방지의 의도다.
  */
-function ownerCaller(argv: string[]): Caller {
+type StepUpOutcome =
+  | { ok: true; stepUp: boolean; device: string }
+  | { ok: false; reason: string; checklist: string[] };
+
+export function chooseStepUpDevice(
+  requested: string | undefined,
+  enrolled: readonly string[],
+): { ok: true; device: string } | { ok: false; reason: string; checklist: string[] } {
+  if (requested) return { ok: true, device: requested };
+  if (enrolled.length === 1) return { ok: true, device: enrolled[0] as string };
+  if (enrolled.length === 0) {
+    return {
+      ok: false,
+      reason: '단계별 인증이 등록된 기기가 없다',
+      checklist: [
+        'company office device add --label "내 폰" 으로 기기를 만드세요',
+        'company office enroll <기기ID> 로 인증 앱에 등록하세요',
+      ],
+    };
+  }
+  // 어느 기기의 코드인지 모르는 채로 검증하면 실패 이유가 "코드가 틀렸다" 로
+  // 나와 오너가 원인을 못 찾는다.
+  return {
+    ok: false,
+    reason: `등록된 기기가 ${enrolled.length}대라 어느 것인지 정해야 한다`,
+    checklist: [`--device <기기ID> 를 붙이세요 (${enrolled.join(', ')})`],
+  };
+}
+
+/**
+ * `--step-up` 을 읽는다.
+ *
+ * **값이 없으면 코드가 없는 것이다.** 뒤에 다른 플래그가 오는 경우도 마찬가지다 —
+ * `--step-up --device x` 에서 `--device` 를 코드로 삼으면 안 된다. 이 판정이
+ * 예전의 "플래그만으로 통과" 를 막는 자리이므로 따로 떼어 시험한다.
+ */
+export function readStepUpCode(argv: string[]): { requested: boolean; code: string | null } {
+  if (!hasFlag(argv, '--step-up')) return { requested: false, code: null };
+  const raw = flagValue(argv, '--step-up');
+  if (!raw || raw.startsWith('--')) return { requested: true, code: null };
+  return { requested: true, code: raw };
+}
+
+function resolveStepUp(argv: string[]): StepUpOutcome {
+  const fallbackDevice = flagValue(argv, '--device') ?? 'cli';
+  const asked = readStepUpCode(argv);
+  if (!asked.requested) {
+    return { ok: true, stepUp: false, device: fallbackDevice };
+  }
+
+  const code = asked.code;
+  if (code === null) {
+    return {
+      ok: false,
+      reason: '--step-up 에 인증 코드가 없다',
+      checklist: [
+        '--step-up <6자리코드> 로 쓰세요. 플래그만으로는 인증이 되지 않습니다',
+        '코드는 company office enroll 로 등록한 인증 앱에서 나옵니다',
+      ],
+    };
+  }
+
+  const { devices, totp } = officeDeps(argv);
+  const picked = chooseStepUpDevice(flagValue(argv, '--device'), totp.enrolledIds());
+  if (!picked.ok) return picked;
+
+  // 검증기는 기기 레코드를 받는다. CLI 는 토큰을 들고 있지 않으므로 id 로 찾는다.
+  const record = devices.list().find((d) => d.id === picked.device);
+  if (!record) {
+    return {
+      ok: false,
+      reason: `기기 ${picked.device} 를 찾을 수 없다`,
+      checklist: ['company office device list 로 기기 id 를 확인하세요'],
+    };
+  }
+
+  const verdict = totp.verify(record, code, 'cli');
+  if (!verdict.ok) {
+    return {
+      ok: false,
+      reason: verdict.reason,
+      checklist: ['인증 앱의 현재 코드를 다시 확인하세요'],
+    };
+  }
+  return { ok: true, stepUp: true, device: record.label };
+}
+
+/** 실패를 사람이 읽는 형태로 출력하고 원장에 남긴다. */
+function reportStepUpFailure(argv: string[], f: Extract<StepUpOutcome, { ok: false }>): number {
+  Ledger.open(ledgerPath(argv)).append({
+    actor: { kind: 'owner', id: 'cli' },
+    kind: 'deny',
+    summary: `CLI 단계별 인증 거부 — ${f.reason}`,
+  });
+  process.stderr.write(`단계별 인증 실패: ${f.reason}\n`);
+  for (const line of f.checklist) process.stderr.write(`  ${line}\n`);
+  return EXIT_CANNOT_RUN;
+}
+
+/** 오너 신원. 단계별 인증은 `resolveStepUp` 이 판정한 결과를 받는다. */
+function ownerCaller(argv: string[], step?: Extract<StepUpOutcome, { ok: true }>): Caller {
   return {
     zone: 'owner',
     id: 'owner',
-    device: flagValue(argv, '--device') ?? 'cli',
-    stepUp: hasFlag(argv, '--step-up'),
+    device: step?.device ?? flagValue(argv, '--device') ?? 'cli',
+    stepUp: step?.stepUp ?? false,
   };
 }
 
@@ -347,7 +458,9 @@ function cmdCaps(argv: string[]): number {
 
     const channels = flagValue(argv, '--channel')?.split(',') ?? [];
     const accounts = flagValue(argv, '--account')?.split(',') ?? [];
-    const state = store.enable(ownerCaller(argv), {
+    const step = resolveStepUp(argv);
+    if (!step.ok) return reportStepUpFailure(argv, step);
+    const state = store.enable(ownerCaller(argv, step), {
       capability: cap,
       ttlMs,
       scope: { channels, accounts },
@@ -367,7 +480,9 @@ function cmdCaps(argv: string[]): number {
       process.stderr.write('능력 이름이 필요합니다.\n');
       return EXIT_CANNOT_RUN;
     }
-    store.disable(ownerCaller(argv), cap);
+    const step = resolveStepUp(argv);
+    if (!step.ok) return reportStepUpFailure(argv, step);
+    store.disable(ownerCaller(argv, step), cap);
     out(`${cap} OFF`);
     return EXIT_OK;
   }
@@ -638,11 +753,11 @@ function approvalService(argv: string[]): { svc: ApprovalService; source: 'file'
   return { svc, source };
 }
 
-function submitter(argv: string[]): Submitter {
+function submitter(argv: string[], step?: Extract<StepUpOutcome, { ok: true }>): Submitter {
   return {
     identity: flagValue(argv, '--as') ?? 'owner',
-    device: flagValue(argv, '--device') ?? 'cli',
-    stepUp: hasFlag(argv, '--step-up'),
+    device: step?.device ?? flagValue(argv, '--device') ?? 'cli',
+    stepUp: step?.stepUp ?? false,
   };
 }
 
@@ -727,7 +842,7 @@ function cmdGate(argv: string[]): number {
   if (decision.approvalId) {
     out(`승인    ${decision.approvalId}`);
     if (decision.reason === 'approval-pending') {
-      out(`        company approvals approve ${decision.approvalId} --digest ${digest}${decision.needsStepUp ? ' --step-up' : ''}`);
+      out(`        company approvals approve ${decision.approvalId} --digest ${digest}${decision.needsStepUp ? ' --step-up <코드>' : ''}`);
     }
   }
   return decision.allowed ? EXIT_OK : EXIT_FINDING;
@@ -1776,7 +1891,11 @@ function cmdApprovals(argv: string[]): number {
       // digest 를 잘라서 보여 주면 안 된다. 그대로 붙여 넣으면 불일치로
       // 판정되어 **카드가 무효가 된다** (R4.6) — 승인하려던 사람이 승인을
       // 못 하게 만드는 표시였다. 바로 실행할 수 있는 줄을 준다.
-      out(`    company approvals approve ${r.id} --digest ${r.payloadDigest}`);
+      // L3 은 단계별 인증이 필요하다. 붙이지 않으면 그대로 복사한 명령이 실패한다.
+      out(
+        `    company approvals approve ${r.id} --digest ${r.payloadDigest}` +
+          (r.level === 'L3' ? ' --step-up <코드>' : ''),
+      );
     }
     return EXIT_OK;
   }
@@ -1793,7 +1912,9 @@ function cmdApprovals(argv: string[]): number {
       process.stderr.write('--digest 는 필수입니다. 승인은 정확한 페이로드에 묶입니다.\n');
       return EXIT_CANNOT_RUN;
     }
-    const outcome = svc.approve(id, submitter(argv), digest);
+    const step = resolveStepUp(argv);
+    if (!step.ok) return reportStepUpFailure(argv, step);
+    const outcome = svc.approve(id, submitter(argv, step), digest);
     if (!outcome.ok) {
       process.stderr.write(`승인 실패: ${outcome.reason}\n`);
       return EXIT_FINDING;
@@ -1842,14 +1963,14 @@ function usage(): void {
   out('');
   out('  능력 스위치 (R8) — 위험한 능력은 기본으로 꺼져 있습니다');
   out('  company caps                        현재 상태와 남은 시간');
-  out('  company caps on <능력> --ttl 2h --step-up [--channel c] [--account a]');
-  out('  company caps off <능력> --step-up');
+  out('  company caps on <능력> --ttl 2h --step-up <코드> [--channel c] [--account a]');
+  out('  company caps off <능력> --step-up <코드>');
   out('  company caps panic [--reason 사유]   전체 차단 (인증 요구 없음)');
   out('');
   out('  정책과 승인 (R4)');
   out('  company classify <작업> [--tainted] [--critic BLOCK] [--sei-risk]');
   out('  company approvals                   대기 중인 승인 카드');
-  out('  company approvals approve <id> --digest <d> --step-up --device phone-1');
+  out('  company approvals approve <id> --digest <d> [--step-up <코드>] [--device 기기ID]');
   out('  company approvals reject <id> [--reason 사유]');
   out('  company approvals abort <id>        유예 창 안에서 중단');
   out('');
@@ -1972,4 +2093,23 @@ async function main(): Promise<number> {
   }
 }
 
-main().then((code) => process.exit(code));
+/**
+ * 진입점 가드.
+ *
+ * 이 파일을 import 하면 `main()` 이 즉시 돌아서 모듈로 쓸 수가 없었다 —
+ * 테스트가 순수 함수 하나를 가져오려 해도 CLI 전체가 실행되고 `process.exit`
+ * 이 불렸다. 실행 파일로 불렸을 때만 돈다.
+ */
+function isEntryPoint(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
+  void main().then((code) => process.exit(code));
+}

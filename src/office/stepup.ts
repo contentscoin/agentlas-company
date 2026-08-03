@@ -155,6 +155,17 @@ export class TotpStepUp implements StepUpVerifier {
   }
 
   /**
+   * 등록된 기기 id 목록.
+   *
+   * CLI 가 기기를 하나만 등록한 경우에 자동으로 고를 수 있게 한다. 둘 이상이면
+   * 고르지 않는다 — 어느 기기의 코드인지 모르는 채로 검증을 시도하면 실패
+   * 이유가 "코드가 틀렸다" 로 나와 오너가 원인을 못 찾는다.
+   */
+  enrolledIds(): string[] {
+    return Object.keys(this.load().secrets);
+  }
+
+  /**
    * 코드를 검증한다.
    *
    * 같은 창의 코드를 두 번 쓰지 못한다. 어깨너머로 본 코드가 30초 안에
