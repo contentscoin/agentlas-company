@@ -5,7 +5,7 @@
 # 좌석 호출 1회의 하한이 약 19.4k 토큰·11초(실측)이므로 스텝 수를 아꼈다.
 # 수다스러운 다회차 구조는 이 시스템에서 성립하지 않는다.
 #
-# publish 는 Task 9 에서, retro 는 R11 에서 실물이 붙었다.
+# publish 는 Task 9 에서, retro 는 R11 에서, studio 는 Task 18.3 에서 실물이 붙었다.
 #
 # retro 의 `expect` 는 필수다 — 예측 없는 복기는 사후 소감이지 복기가
 # 아니다 (R11.6). `channel` 을 적으면 지표 어댑터가 실측을 읽어 예측과
@@ -40,12 +40,20 @@ steps:
 
       {{trend_brief}}
 
+  # Studio 스텝은 좌석 산출에 더해 브랜드 대조와 결정론적 검증까지 한다.
+  # 그 판정이 산출물 `draft` 에 묶여 발행 스텝까지 따라간다 — 그래서 발행에
+  # `brandOk` 를 적을 필요가 없다 (Task 15.3, 18.3).
+  #
+  # 검증 BLOCK 이면 여기서 멈춘다. 나갈 수 없는 본문에 뒤 좌석 호출을 더
+  # 쓰는 것은 낭비다 (1회 하한 19.4k 토큰).
   - id: draft
-    kind: seat
+    kind: studio
     title: 본문 초안
-    persona: studio
     produce: draft
-    instruction: |
+    # 브랜드 팩을 지정하지 않으면 규칙 없이 대조하고 그 사실이 판정에 남는다.
+    # 팩이 준비되면 여기에 경로를 적는다.
+    # pack: brand/pack.json
+    brief: |
       아래 기획의 첫 번째 항목을 실제 발행 본문으로 작성하라.
       링크는 브랜드 도메인만 사용하라. 출처 없는 수치를 쓰지 마라.
 
@@ -82,9 +90,8 @@ steps:
     title: 쓰레드 발행
     channel: threads
     subject: draft
-    # 브랜드 대조는 Studio 가 하고, 여기서는 오너가 책임을 진다는 선언이다.
-    # Studio 스텝이 생기면 이 줄은 사라진다 (Task 15.3).
-    brandOk: true
+    # brandOk 가 없다. `draft` 에 Studio 의 판정이 붙어 있고 발행 스텝은
+    # 그것을 본다 — 실제로 대조한 결과를 레시피 선언으로 덮을 수 없다.
 
   - id: retro
     kind: retro

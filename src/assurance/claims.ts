@@ -136,3 +136,22 @@ export function describeClaim(c: Claim): string {
         : `팩인용(${c.evidence.length})`;
   return `${grade} ${c.kind} "${c.text}" (위치 ${c.index})`;
 }
+
+/**
+ * 근거 인용을 뽑는다 (R5.1).
+ *
+ * 형식을 강제하지 않고 흔한 두 형태를 받는다 — `[출처] …` 줄과 URL.
+ * 하나도 없으면 빈 배열이다. **인용을 지어내지 않는다.**
+ *
+ * Studio 와 검증이 같은 규칙을 써야 한다. 예전에 클레임 패턴을 두 곳에 두었다가
+ * 한쪽만 개선되는 일을 겪었다 — 인용도 같은 종류의 값이라 정본을 하나로 둔다.
+ */
+export function extractCitations(text: string): string[] {
+  const cites = new Set<string>();
+  for (const line of text.split('\n')) {
+    const tagged = /^\s*\[(?:출처|근거|source|ref)\]\s*(.+)$/i.exec(line);
+    if (tagged?.[1]) cites.add(tagged[1].trim());
+  }
+  for (const url of text.match(/https?:\/\/[^\s)\]]+/g) ?? []) cites.add(url);
+  return [...cites];
+}

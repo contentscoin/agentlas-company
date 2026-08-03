@@ -13,7 +13,7 @@
 
 import type { AutonomyLevel } from '../ledger/types.js';
 
-export type StepKind = 'seat' | 'gate' | 'approval' | 'publish' | 'retro';
+export type StepKind = 'seat' | 'gate' | 'approval' | 'publish' | 'retro' | 'studio';
 
 interface StepBase {
   /** 레시피 안에서 고유한 식별자. 재개 지점이 된다. */
@@ -60,6 +60,38 @@ export interface ApprovalStep extends StepBase {
 }
 
 /**
+ * Studio 산출과 검증 (R5, R11.3~R11.5).
+ *
+ * 좌석 스텝과 나누는 이유는 **판정이 따라붙기 때문**이다. 좌석 스텝은
+ * 텍스트만 남기지만 Studio 스텝은 브랜드 대조와 결정론적 검증을 거쳐
+ * 그 결과를 산출물에 묶는다. 그래야 발행 스텝이 레시피에 적힌
+ * `brandOk: true` 선언 대신 **실제로 대조된 결과**를 볼 수 있다.
+ */
+export interface StudioStep extends StepBase {
+  kind: 'studio';
+  /** 무엇을 만들지. 좌석에 전달할 기획 의도. */
+  brief: string;
+  /** 산출물 이름. 발행 스텝이 이 이름으로 본문과 판정을 함께 받는다. */
+  produce: string;
+  /** 채울 슬롯. 기본은 copy 하나. */
+  want?: string[];
+  /**
+   * 브랜드 팩 파일 경로.
+   *
+   * 없으면 규칙 없이 대조하고 **그 사실을 판정에 남긴다** — 규칙이 없어서
+   * 위반이 없는 것과 대조해서 위반이 없는 것은 다른 사실이다.
+   */
+  pack?: string;
+  /**
+   * 검증 BLOCK 이어도 계속할지. 기본은 거짓.
+   *
+   * BLOCK 은 나가면 안 되는 것이고, 나갈 수 없는 본문에 좌석 호출을 더 쓰는
+   * 것은 낭비다 (1회 하한 19.4k 토큰). 수정 루프를 돌리는 레시피만 켠다.
+   */
+  continueOnBlock?: boolean;
+}
+
+/**
  * 채널 발행 (R6, R12.1).
  *
  * `subject` 는 **이전 스텝의 산출물 이름**이다. 본문을 레시피에 직접 적지
@@ -74,8 +106,11 @@ export interface PublishStep extends StepBase {
    * 브랜드 대조를 통과한 것으로 볼지.
    *
    * 기본은 거짓이고, 그러면 발행 브로커가 막는다 (R5.5). 레시피에 적는다는
-   * 것은 오너가 브랜드 책임을 진다는 선언이다 — Studio 스텝이 붙기 전까지의
-   * 임시 통로이며, 기본값으로 열어 두지 않는다.
+   * 것은 오너가 브랜드 책임을 진다는 선언이다.
+   *
+   * **산출물에 판정이 붙어 있으면 그쪽이 이긴다.** Studio 스텝이 실제로
+   * 대조한 결과를 레시피의 선언으로 덮을 수 있다면 대조할 이유가 없다 —
+   * 이 필드는 Studio 를 거치지 않은 산출물에만 쓰인다.
    */
   brandOk?: boolean;
   /** 실제로 내보내지 않고 페이로드만 확인한다 (R6.4). */
@@ -101,7 +136,7 @@ export interface RetroStep extends StepBase {
   to?: string;
 }
 
-export type Step = SeatStep | GateStep | ApprovalStep | PublishStep | RetroStep;
+export type Step = SeatStep | GateStep | ApprovalStep | PublishStep | RetroStep | StudioStep;
 
 export interface Recipe {
   name: string;
@@ -138,9 +173,27 @@ export interface RunState {
   steps: StepState[];
   /** 산출물 저장. 이름 → 텍스트. */
   artifacts: Record<string, string>;
+  /**
+   * 산출물에 붙은 판정. 이름 → 브랜드·검증 결과.
+   *
+   * **스텝이 아니라 산출물에 묶는다.** 발행 스텝은 자기 `subject` 로만
+   * 산출물을 알고, 그것을 누가 만들었는지는 모른다 — 판정이 산출물을 따라와야
+   * 중간에 스텝이 끼어도 이어진다.
+   */
+  judgments?: Record<string, ArtifactJudgment>;
   /** 오염 전파. 한 번 오염되면 그 실행의 이후 산출물도 오염이다. */
   tainted: boolean;
   detail?: string;
+}
+
+/** 산출물에 붙는 브랜드·검증 판정 (R5.4, R11.3~R11.5). */
+export interface ArtifactJudgment {
+  brandPass: boolean;
+  brandNotes: string[];
+  verdict: 'PASS' | 'FAIL' | 'BLOCK';
+  assuranceNotes: string[];
+  /** 브랜드 팩 없이 대조했는가. 규칙이 없어서 통과한 것을 통과로 읽지 않게 한다. */
+  packless: boolean;
 }
 
 export interface RunOutcome {

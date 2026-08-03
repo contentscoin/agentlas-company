@@ -18,6 +18,7 @@ import type { Ledger } from '../ledger/ledger.js';
 import type { SeatBroker } from '../seats/broker.js';
 import { checkBrand, describeViolation, findUnsupportedClaims, type BrandPack } from './brandpack.js';
 import { publishReadiness, type Artifact, type Slot, type SlotKind } from './artifact.js';
+import { extractCitations } from '../assurance/claims.js';
 
 /** 이미지·영상이 막힌 이유. 한 곳에 두어 문구가 갈라지지 않게 한다. */
 export const BLOCKED_BY_DESKTOP =
@@ -42,23 +43,6 @@ export interface ProduceRequest {
   tainted?: boolean;
 }
 
-/**
- * 좌석 응답에서 근거 인용을 뽑는다 (R5.1).
- *
- * 형식을 강제하지 않고 흔한 두 형태를 받는다 — `[출처] ...` 줄과 URL.
- * 하나도 없으면 빈 배열이다. **인용을 지어내지 않는다** — 없으면 없는 것이고,
- * 그 사실이 슬롯에 그대로 남아 오너가 판단할 수 있어야 한다.
- */
-export function extractCitations(text: string): string[] {
-  const cites = new Set<string>();
-  for (const line of text.split('\n')) {
-    const tagged = /^\s*\[(?:출처|근거|source|ref)\]\s*(.+)$/i.exec(line);
-    if (tagged?.[1]) cites.add(tagged[1].trim());
-  }
-  const urls = text.match(/https?:\/\/[^\s)\]]+/g) ?? [];
-  for (const url of urls) cites.add(url);
-  return [...cites];
-}
 
 export class Studio {
   private readonly opts: StudioOptions;
@@ -174,4 +158,4 @@ export class Studio {
   }
 }
 
-export { publishReadiness };
+export { publishReadiness, extractCitations };

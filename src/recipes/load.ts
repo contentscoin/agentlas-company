@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import type { Recipe, Step } from './types.js';
 import { isChannel } from '../verbs/types.js';
+import { SLOT_KINDS } from '../studio/artifact.js';
 
 export class RecipeError extends Error {
   readonly problems: string[];
@@ -19,7 +20,7 @@ export class RecipeError extends Error {
   }
 }
 
-const STEP_KINDS = ['seat', 'gate', 'approval', 'publish', 'retro'];
+const STEP_KINDS = ['seat', 'gate', 'approval', 'publish', 'retro', 'studio'];
 
 /** 레시피를 검증한다. 문제 목록을 모두 모아서 돌려준다. */
 export function validateRecipe(value: unknown): string[] {
@@ -60,6 +61,31 @@ export function validateRecipe(value: unknown): string[] {
         if (typeof s[key] !== 'string' || s[key] === '') problems.push(`${at}.${key} 가 필요하다`);
       }
       if (typeof s['produce'] === 'string') produced.add(s['produce']);
+    }
+
+    if (kind === 'studio') {
+      for (const key of ['brief', 'produce']) {
+        if (typeof s[key] !== 'string' || s[key] === '') problems.push(`${at}.${key} 가 필요하다`);
+      }
+      if (typeof s['produce'] === 'string') produced.add(s['produce']);
+      const want = s['want'];
+      if (want !== undefined) {
+        if (!Array.isArray(want) || want.length === 0) {
+          problems.push(`${at}.want 는 비어 있지 않은 배열이어야 한다`);
+        } else {
+          // 슬롯 이름을 실행 전에 막는다. 오타 하나로 좌석 호출을 날리지 않는다.
+          const bad = want.filter((w) => typeof w !== 'string' || !(SLOT_KINDS as readonly string[]).includes(w));
+          if (bad.length > 0) {
+            problems.push(`${at}.want 에 알 수 없는 슬롯: ${bad.join(', ')} (허용: ${SLOT_KINDS.join(', ')})`);
+          }
+        }
+      }
+      if (s['pack'] !== undefined && (typeof s['pack'] !== 'string' || s['pack'] === '')) {
+        problems.push(`${at}.pack 은 파일 경로 문자열이어야 한다`);
+      }
+      if (s['continueOnBlock'] !== undefined && typeof s['continueOnBlock'] !== 'boolean') {
+        problems.push(`${at}.continueOnBlock 은 불리언이어야 한다`);
+      }
     }
 
     if (kind === 'gate' && (typeof s['command'] !== 'string' || s['command'] === '')) {

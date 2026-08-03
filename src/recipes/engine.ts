@@ -28,12 +28,25 @@ import type { ApprovalService } from '../policy/approval.js';
 import { classify } from '../policy/policy.js';
 import type { PolicyConfig } from '../policy/types.js';
 import { RunLock } from './lock.js';
-import type { Recipe, RetroStep, RunOutcome, RunState, Step, StepState } from './types.js';
+import type {
+  ArtifactJudgment,
+  Recipe,
+  RetroStep,
+  RunOutcome,
+  RunState,
+  Step,
+  StepState,
+} from './types.js';
 import type { PublishBroker } from '../publish/broker.js';
 import { isChannel } from '../verbs/types.js';
 import { compare, noPrediction } from '../assurance/retro.js';
 import type { Observed } from '../assurance/retro.js';
 import type { MetricsBroker } from '../metrics/broker.js';
+import { Studio } from '../studio/studio.js';
+import { SLOT_KINDS, type Slot, type SlotKind } from '../studio/artifact.js';
+import type { BrandPack } from '../studio/brandpack.js';
+import { extractCitations, registerClaims } from '../assurance/claims.js';
+import { assure } from '../assurance/checks.js';
 
 export interface EngineOptions {
   ledger: Ledger;
@@ -59,7 +72,27 @@ export interface EngineOptions {
    * 고치라" 는 제안을 내기 때문이다 — 그것이 지금 가장 쓸모 있는 산출이다.
    */
   metrics?: MetricsBroker;
+  /**
+   * 브랜드 팩 로더. 기본은 파일에서 읽는다.
+   *
+   * 테스트가 파일 없이 팩을 물릴 수 있게 열어 둔다. 읽지 못하면 **빈 팩으로
+   * 조용히 넘어가지 않는다** — 규칙 파일을 못 읽은 것과 규칙이 없는 것은
+   * 다른 사실이고, 전자는 오탈자일 가능성이 크다.
+   */
+  loadBrandPack?: (file: string) => BrandPack;
 }
+
+/** 규칙 없이 대조했는지까지 함께 돌려준다. */
+interface LoadedPack {
+  pack: BrandPack;
+  packless: boolean;
+}
+
+const EMPTY_PACK: BrandPack = {
+  masterSheet: { forbidden: [], required: [] },
+  characters: [],
+  contentBase: { claims: [] },
+};
 
 export class RecipeEngine {
   private readonly ledger: Ledger;
@@ -67,6 +100,7 @@ export class RecipeEngine {
   private readonly approvals: ApprovalService;
   private readonly publisher: PublishBroker | undefined;
   private readonly metrics: MetricsBroker | undefined;
+  private readonly readPack: (file: string) => BrandPack;
   private readonly policy: PolicyConfig;
   private readonly stateDir: string;
   private readonly gateTimeoutMs: number;
@@ -80,6 +114,8 @@ export class RecipeEngine {
     this.gateTimeoutMs = opts.gateTimeoutMs ?? 120_000;
     this.publisher = opts.publisher;
     this.metrics = opts.metrics;
+    this.readPack =
+      opts.loadBrandPack ?? ((file) => JSON.parse(readFileSync(file, 'utf8')) as BrandPack);
     mkdirSync(join(this.stateDir, 'runs'), { recursive: true });
   }
 
@@ -370,6 +406,21 @@ export class RecipeEngine {
           return 'stop';
         }
 
+        // 산출물에 판정이 붙어 있으면 그것을 쓴다. 레시피의 `brandOk` 선언은
+        // Studio 를 거치지 않은 산출물에만 쓰인다 — 실제로 대조한 결과를
+        // 선언으로 덮을 수 있다면 대조할 이유가 없다.
+        const judged = state.judgments?.[step.subject];
+        if (judged && step.brandOk && !judged.brandPass) {
+          this.ledger.append({
+            actor: { kind: 'system', id: 'recipe-engine' },
+            kind: 'deny',
+            runId: state.runId,
+            summary:
+              `${step.id}: 레시피의 brandOk 선언을 무시했다 — ` +
+              `${step.subject} 는 실제 대조에서 브랜드 FAIL 이다`,
+          });
+        }
+
         const result = await this.publisher.publish({
           channel: step.channel,
           verb: { op: 'post_text', channel: step.channel, body },
@@ -378,7 +429,19 @@ export class RecipeEngine {
           idempotencyKey: `${state.runId}:${step.id}`,
           runId: state.runId,
           ...(step.dryRun ? { dryRun: true } : {}),
-          ...(step.brandOk ? { brandPass: true } : {}),
+          // 판정이 있으면 **거짓도 그대로 넘긴다.** 빼먹으면 undefined 가 되고
+          // 브로커가 "브랜드 대조를 하지 않았다" 로 읽는다 — 대조해서 떨어진
+          // 것과 대조를 안 한 것은 오너가 할 일이 다르다.
+          ...(judged
+            ? {
+                brandPass: judged.brandPass,
+                brandNotes: judged.brandNotes,
+                assurance: judged.verdict,
+                assuranceNotes: judged.assuranceNotes,
+              }
+            : step.brandOk
+              ? { brandPass: true }
+              : {}),
         });
 
         if (!result.ok) {
@@ -396,6 +459,102 @@ export class RecipeEngine {
             ? '드라이런 — 실제로 나가지 않았다'
             : `발행 완료${result.evidence?.url ? ` — ${result.evidence.url}` : ''}`;
         if (result.evidence?.url) state.artifacts[`${step.id}.url`] = result.evidence.url;
+        return 'continue';
+      }
+
+      case 'studio': {
+        // Studio 는 좌석 산출 + 브랜드 대조까지 한다 (R5). 검증은 여기서 잇는다.
+        let packLoad: LoadedPack;
+        try {
+          packLoad = this.loadPack(step.pack);
+        } catch (err) {
+          // 규칙 파일을 못 읽었다. 빈 팩으로 넘어가면 "규칙이 없어서 통과" 가
+          // "대조해서 통과" 로 보고된다 — 여기서 멈춘다.
+          st.status = 'failed';
+          st.detail = `브랜드 팩을 읽지 못했다 (${step.pack}): ${(err as Error).message}`;
+          return 'stop';
+        }
+        const studio = new Studio({ broker: this.broker, ledger: this.ledger, pack: packLoad.pack });
+
+        const want = (step.want ?? ['copy']).filter((w): w is SlotKind =>
+          (SLOT_KINDS as readonly string[]).includes(w),
+        );
+        if (want.length === 0) {
+          st.status = 'failed';
+          st.detail = `채울 슬롯이 없다 — want 에 ${SLOT_KINDS.join(', ')} 중 하나가 필요하다`;
+          return 'stop';
+        }
+
+        const artifact = await studio.produce({
+          title: step.title ?? step.produce,
+          brief: buildSeatPrompt(step.brief, state.artifacts),
+          want,
+          runId: state.runId,
+          ...(state.tainted ? { tainted: true } : {}),
+        });
+
+        const body = artifact.slots
+          .filter((sl): sl is Extract<Slot, { state: 'filled' }> => sl.state === 'filled')
+          .map((sl) => sl.content)
+          .join('\n\n');
+
+        if (body === '') {
+          // 채워진 슬롯이 없다. 빈 본문을 산출물로 남기면 다음 스텝이
+          // 빈 자리로 발행한다 — 여기서 멈추는 편이 낫다.
+          st.status = 'failed';
+          st.detail =
+            '채워진 슬롯이 없다 — ' +
+            artifact.slots.map((sl) => `${sl.kind}: ${sl.state === 'filled' ? '충족' : (sl.reason ?? sl.state)}`).join(' / ');
+          return 'stop';
+        }
+
+        // 검증 (R11.3~R11.5). 근거 등급의 기준은 브랜드 팩의 콘텐츠 베이스다 —
+        // 팩에 없는 수치는 미검증이고, 미검증은 BLOCK 이다.
+        const claims = registerClaims(body, {
+          packFacts: packLoad.pack.contentBase.claims,
+          measured: [],
+        });
+        const assurance = assure({
+          text: body,
+          claims,
+          citations: extractCitations(body),
+          sei: { ran: false, note: 'sei CLI 가 설치되어 있지 않다 — 자체 검사만 돌렸다' },
+        });
+
+        const judgment: ArtifactJudgment = {
+          brandPass: artifact.brandPass === true,
+          brandNotes: artifact.brandNotes,
+          verdict: assurance.verdict,
+          assuranceNotes: assurance.findings.map((f) => f.detail),
+          packless: packLoad.packless,
+        };
+
+        state.artifacts[step.produce] = body;
+        state.judgments = { ...state.judgments, [step.produce]: judgment };
+
+        this.ledger.append({
+          actor: { kind: 'system', id: 'studio' },
+          kind: 'gate.verdict',
+          runId: state.runId,
+          payloadDigest: digestPayload(body),
+          summary:
+            `${step.produce} — 브랜드 ${judgment.brandPass ? 'PASS' : 'FAIL'}, 검증 ${judgment.verdict}` +
+            (judgment.packless ? ' (브랜드 팩 없음)' : ''),
+          evidence: [...judgment.brandNotes, ...judgment.assuranceNotes],
+        });
+
+        const summary =
+          `브랜드 ${judgment.brandPass ? 'PASS' : 'FAIL'}, 검증 ${judgment.verdict}` +
+          (judgment.packless ? ' (브랜드 팩 없이 대조 — 규칙이 없어서 통과한 것이다)' : '');
+
+        if (judgment.verdict === 'BLOCK' && !step.continueOnBlock) {
+          st.status = 'failed';
+          st.detail = [summary, ...judgment.assuranceNotes].join('\n  ');
+          return 'stop';
+        }
+
+        st.status = 'passed';
+        st.detail = [summary, ...judgment.brandNotes, ...judgment.assuranceNotes].join('\n  ');
         return 'continue';
       }
 
@@ -445,6 +604,18 @@ export class RecipeEngine {
         return 'continue';
       }
     }
+  }
+
+  /**
+   * 브랜드 팩을 읽는다.
+   *
+   * 파일을 못 읽으면 던진다 — 빈 팩으로 넘어가면 "규칙이 없어서 통과" 가
+   * "대조해서 통과" 로 보고된다. 경로를 안 적은 경우만 규칙 없음이고,
+   * 그 사실은 판정에 `packless` 로 남는다.
+   */
+  private loadPack(file: string | undefined): LoadedPack {
+    if (!file) return { pack: EMPTY_PACK, packless: true };
+    return { pack: this.readPack(file), packless: false };
   }
 
   /**

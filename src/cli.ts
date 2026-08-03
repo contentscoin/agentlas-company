@@ -50,7 +50,7 @@ import { ALL_PERSONAS } from './org/personas.js';
 import { checkHealth } from './ops/health.js';
 import { detectAnomalies, describeAnomaly, unreadableLedger } from './ops/anomaly.js';
 import { buildDigest, renderDigest } from './ops/digest.js';
-import { registerClaims, describeClaim } from './assurance/claims.js';
+import { registerClaims, describeClaim, extractCitations } from './assurance/claims.js';
 import { MetricsBroker } from './metrics/broker.js';
 import { ThreadsMetricsAdapter } from './metrics/adapters/threads.js';
 import { SmartstoreMetricsAdapter } from './metrics/adapters/smartstore.js';
@@ -1430,7 +1430,7 @@ function cmdAssure(argv: string[]): number {
   }
 
   const claims = registerClaims(text, sources);
-  const citations = extractCitationLines(text);
+  const citations = extractCitations(text);
   // SEI 는 아직 이 기계에 없다. 못 돌린 사실을 판정에 싣는다.
   const result = assure({
     text,
@@ -1463,15 +1463,6 @@ function cmdAssure(argv: string[]): number {
 }
 
 /** `[출처]` 줄과 URL 을 인용으로 센다. Studio 의 규약과 같다. */
-function extractCitationLines(text: string): string[] {
-  const cites = new Set<string>();
-  for (const line of text.split('\n')) {
-    const m = /^\s*\[(?:출처|근거|source|ref)\]\s*(.+)$/i.exec(line);
-    if (m?.[1]) cites.add(m[1].trim());
-  }
-  for (const url of text.match(/https?:\/\/[^\s)\]]+/g) ?? []) cites.add(url);
-  return [...cites];
-}
 
 /**
  * 지표 수집 (R11.6, R7.6).
@@ -1558,7 +1549,11 @@ function cmdApprovals(argv: string[]): number {
     for (const r of rows) {
       out(`${r.id}  ${r.level}  ${r.action}${r.irreversible ? ' [비가역]' : ''}`);
       out(`    ${r.summary}`);
-      out(`    만료 ${r.expiresAt}  digest ${r.payloadDigest.slice(0, 12)}`);
+      out(`    만료 ${r.expiresAt}`);
+      // digest 를 잘라서 보여 주면 안 된다. 그대로 붙여 넣으면 불일치로
+      // 판정되어 **카드가 무효가 된다** (R4.6) — 승인하려던 사람이 승인을
+      // 못 하게 만드는 표시였다. 바로 실행할 수 있는 줄을 준다.
+      out(`    company approvals approve ${r.id} --digest ${r.payloadDigest}`);
     }
     return EXIT_OK;
   }
