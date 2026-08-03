@@ -51,6 +51,13 @@ import { checkHealth } from './ops/health.js';
 import { detectAnomalies, describeAnomaly, unreadableLedger } from './ops/anomaly.js';
 import { buildDigest, renderDigest } from './ops/digest.js';
 import { registerClaims, describeClaim, extractCitations } from './assurance/claims.js';
+import {
+  SEI_BIN_ENV,
+  SEI_NOT_FOR_TEXT,
+  describeFinding as describeSeiFinding,
+  runSei,
+  seiBin,
+} from './assurance/sei.js';
 import { MetricsBroker } from './metrics/broker.js';
 import { ThreadsMetricsAdapter } from './metrics/adapters/threads.js';
 import { SmartstoreMetricsAdapter } from './metrics/adapters/smartstore.js';
@@ -1399,6 +1406,47 @@ function cmdOps(argv: string[]): number {
  * 산출물의 클레임을 등록하고 결정론적 검사를 돌린다. `BLOCK` 이면 발행이
  * 막힌다 (R11.5) — 이 명령은 그 판정을 미리 보는 자리다.
  */
+/**
+ * 프로젝트 위험 신호 (R11.3, R16.4).
+ *
+ * **설계가 SEI 에 있다고 가정한 균일 계약(0 성공 / 1 발견 / 2 실행 불가)을
+ * 여기서 제공한다.** 실제 `sei` 는 `inspect` 에서 high 심각도 발견이 있어도
+ * 0 으로 끝나므로, 그것을 그대로 게이트에 쓰면 발견을 통과로 읽는다.
+ * 이 명령은 위험을 JSON 본문에서 읽어 1 로 내보낸다 — 레시피 `gate` 스텝이
+ * `company sei` 를 그대로 쓸 수 있다.
+ */
+async function cmdSei(argv: string[]): Promise<number> {
+  const project = flagValue(argv, '--project') ?? process.cwd();
+  const signal = await runSei({
+    project,
+    ...(flagValue(argv, '--bin') ? { bin: flagValue(argv, '--bin') as string } : {}),
+  });
+
+  if (hasFlag(argv, '--json')) {
+    jsonOut(signal);
+    if (!signal.ran) return EXIT_CANNOT_RUN;
+    return signal.risk ? EXIT_FINDING : EXIT_OK;
+  }
+
+  if (!signal.ran) {
+    // 못 돌린 것을 통과로 보고하지 않는다.
+    out(`SEI 실행 못 함 — ${signal.reason}: ${signal.detail}`);
+    for (const line of signal.checklist) out(`  ${line}`);
+    out(`  실행 파일: ${seiBin()} (${SEI_BIN_ENV} 로 바꿀 수 있습니다)`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  out(`SEI  ${signal.risk ? '위험 신호 있음' : '위험 신호 없음'}  ${project}`);
+  out(`  ${signal.detail}`);
+  if (signal.toolVersion) out(`  sei ${signal.toolVersion}`);
+  for (const f of signal.findings) out(`  ${describeSeiFinding(f)}`);
+  if (signal.findings.length > 0) {
+    out('');
+    out('  발견은 후보입니다. 확정 결함으로 읽지 마세요 — SEI 자신이 그렇게 표시합니다.');
+  }
+  return signal.risk ? EXIT_FINDING : EXIT_OK;
+}
+
 function cmdAssure(argv: string[]): number {
   const file = flagValue(argv, '--file') ?? argv[1];
   if (!file || file.startsWith('--')) {
@@ -1431,12 +1479,13 @@ function cmdAssure(argv: string[]): number {
 
   const claims = registerClaims(text, sources);
   const citations = extractCitations(text);
-  // SEI 는 아직 이 기계에 없다. 못 돌린 사실을 판정에 싣는다.
+  // SEI 는 코드 프로젝트를 검사한다. 본문은 대상이 아니다 — "설치하면 된다"
+  // 로 적으면 잘못된 기대를 남긴다 (`assurance/sei.ts` 참조).
   const result = assure({
     text,
     claims,
     citations,
-    sei: { ran: false, note: 'sei CLI 가 설치되어 있지 않다 — 자체 검사만 돌렸다' },
+    sei: { ran: false, note: SEI_NOT_FOR_TEXT },
   });
 
   if (hasFlag(argv, '--json')) {
@@ -1653,6 +1702,7 @@ function usage(): void {
   out('');
   out('  지표 (R11.6, R7.6) — 좌석으로 넘어가는 것은 집계값뿐이다');
   out('  company metrics --channel smartstore [--from …] [--to …]');
+  out('  company sei [--project <경로>]        프로젝트 위험 신호 (0 없음 / 1 있음 / 2 못 돌림)');
   out('');
   out('  검증 (R11) — 클레임 등록과 결정론적 검사. BLOCK 은 발행을 막는다');
   out('  company assure <산출물.txt> [--facts <팩.json>]');
@@ -1717,6 +1767,8 @@ async function main(): Promise<number> {
         return cmdOps(argv);
       case 'assure':
         return cmdAssure(argv);
+      case 'sei':
+        return await cmdSei(argv);
       case 'metrics':
         return await cmdMetrics(argv);
       case 'approvals':
