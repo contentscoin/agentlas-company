@@ -30,6 +30,14 @@ export type EventKind =
   | 'switch.change'
   /** 오피스 기기 등록·폐기 (R14.3, R14.4). 접속권의 변경은 별도 감사 대상이다. */
   | 'device.change'
+  /**
+   * 에이전트 권한 승격·회수 (R13.3).
+   *
+   * `device.change` 와 같은 이유로 따로 둔다 — "무엇을 만질 수 있는가" 의
+   * 변경은 그 자체가 감사 대상이고, `decision` 에 섞이면 채용·실행 결정
+   * 사이에서 찾을 수 없다.
+   */
+  | 'permission.change'
   | 'hands.step'
   | 'publish'
   | 'deny'

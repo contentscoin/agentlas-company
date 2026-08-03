@@ -15,6 +15,8 @@
  * 권한 부여는 "이 에이전트가 무엇을 만질 수 있다" 로, 다른 결정이다.
  */
 
+import { createHash } from 'node:crypto';
+
 /** 차용 패키지에 줄 수 있는 권한. 이 목록에 없는 것은 존재하지 않는다. */
 export const GRANTABLE = ['read_ledger', 'seat_call', 'draft_write'] as const;
 
@@ -49,6 +51,27 @@ export function defaultBuiltPermissions(): AgentPermissions {
 
 export function isGrantable(value: unknown): value is Grantable {
   return typeof value === 'string' && (GRANTABLE as readonly string[]).includes(value);
+}
+
+/**
+ * 권한 부여 대상의 digest. 승인은 이 값에 묶인다 (R4.5, R4.6).
+ *
+ * **패키지 digest 를 함께 넣는다.** "이 에이전트에 이 권한을 준다" 에서
+ * "이 에이전트" 는 우리가 살펴본 그 내용물이다. 패키지가 바뀌면 같은 id 라도
+ * 다른 것이고, 예전 승인이 새 내용물로 넘어오면 안 된다.
+ *
+ * 권한은 정렬해서 넣는다 — 적은 순서가 달라졌다고 다른 승인이 되면 오너가
+ * 같은 결정을 두 번 하게 된다.
+ */
+export function grantDigest(
+  agentId: string,
+  packageDigest: string,
+  permissions: readonly string[],
+): string {
+  return createHash('sha256')
+    .update('agentlas:hire-grant:v1\0')
+    .update(JSON.stringify({ agentId, packageDigest, permissions: [...permissions].sort() }))
+    .digest('hex');
 }
 
 export interface GrantResult {

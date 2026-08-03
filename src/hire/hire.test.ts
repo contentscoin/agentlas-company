@@ -8,7 +8,15 @@ import { DEFAULT_POLICY } from '../policy/policy.js';
 import { parseCloseBlock } from '../org/protocol.js';
 import { HireBroker, checkBudget, hireDigest } from './hire.js';
 import { pinBorrowed, readBorrowed, renderBorrowed, writeLock, type BorrowedAgent } from './lock.js';
-import { GRANTABLE, NEVER_BY_DEFAULT, defaultBorrowedPermissions, defaultBuiltPermissions, grant } from './permissions.js';
+import {
+  GRANTABLE,
+  NEVER_BY_DEFAULT,
+  defaultBorrowedPermissions,
+  defaultBuiltPermissions,
+  grant,
+  grantDigest,
+  type Grantable,
+} from './permissions.js';
 import type { HireRequest } from '../org/protocol.js';
 
 let dir: string;
@@ -264,5 +272,62 @@ describe('HireBroker — 순서 (R13.4, R13.5)', () => {
     await b.hire(REQ, LOCK_SEED);
     const done = ledger.query({ kind: 'decision' }).find((e) => e.summary?.includes('채용 완료'));
     expect(done?.level).toBe('L3');
+  });
+});
+
+describe('권한 승격은 채용과 별개 결정이다 (R13.3, Task 16.3)', () => {
+  const PKG = 'a'.repeat(64);
+
+  it('같은 에이전트라도 권한 집합이 다르면 다른 승인이다', () => {
+    const one = grantDigest('hub/x', PKG, ['read_ledger']);
+    const two = grantDigest('hub/x', PKG, ['read_ledger', 'seat_call']);
+    expect(one).not.toBe(two);
+  });
+
+  it('적은 순서가 달라도 같은 승인이다 — 오너가 같은 결정을 두 번 하지 않는다', () => {
+    expect(grantDigest('hub/x', PKG, ['seat_call', 'read_ledger'])).toBe(
+      grantDigest('hub/x', PKG, ['read_ledger', 'seat_call']),
+    );
+  });
+
+  /**
+   * "이 에이전트에 이 권한을 준다" 에서 "이 에이전트" 는 우리가 살펴본
+   * 그 내용물이다. 패키지가 바뀌면 예전 승인이 넘어오면 안 된다.
+   */
+  it('패키지 내용이 바뀌면 다른 승인이다', () => {
+    expect(grantDigest('hub/x', PKG, ['read_ledger'])).not.toBe(
+      grantDigest('hub/x', 'b'.repeat(64), ['read_ledger']),
+    );
+  });
+
+  it('채용 승인과 digest 가 겹치지 않는다', () => {
+    const hire = hireDigest({ mode: 'borrow', target: 'hub/x', reason: 'r' });
+    expect(grantDigest('hub/x', PKG, ['read_ledger'])).not.toBe(hire);
+  });
+
+  it('hire.grant 는 L3 다', () => {
+    expect(DEFAULT_POLICY.levels.L3).toContain('hire.grant');
+    // 채용과 별개 항목으로 남아 있어야 한다.
+    expect(DEFAULT_POLICY.levels.L3).toContain('hire');
+  });
+
+  it('줄 수 없는 권한은 부여되지 않고 이유가 남는다', () => {
+    const r = grant({ granted: [] }, ['read_ledger', 'hands']);
+    expect(r.ok).toBe(false);
+    expect(r.permissions.granted).toEqual(['read_ledger']);
+    expect(r.refused.join()).toContain('hands');
+  });
+
+  it('회수는 lock 왕복을 견딘다', () => {
+    const agent = {
+      id: 'hub/x',
+      digest: PKG,
+      at: '2026-08-01T00:00:00.000Z',
+      approvalId: 'card-1',
+      permissions: { granted: ['read_ledger', 'seat_call'] as Grantable[] },
+      reason: '사유',
+    };
+    const text = renderBorrowed([{ ...agent, permissions: { granted: ['read_ledger'] } }]);
+    expect(readBorrowed(text)[0]?.permissions.granted).toEqual(['read_ledger']);
   });
 });

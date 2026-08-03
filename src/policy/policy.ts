@@ -28,7 +28,10 @@ export const DEFAULT_POLICY: PolicyConfig = {
     L0: ['meeting', 'plan', 'draft', 'analyze', 'verify'],
     L1: [],
     L2: [],
-    L3: ['spend', 'hire', 'credential.change', 'irreversible'],
+    // `hire.grant` 는 채용과 **별개** 결정이다 (R13.3). 채용은 "이 에이전트를
+    // 들인다" 이고 권한 부여는 "이 에이전트가 무엇을 만질 수 있다" 로,
+    // 승인 카드도 따로 나가야 한다.
+    L3: ['spend', 'hire', 'hire.grant', 'credential.change', 'irreversible'],
   },
   escalateWhen: { criticBlock: true, seiRiskSignal: true, outputTainted: true },
   approval: { cardTtlMs: 12 * 3_600_000, coolingWindowMs: 120_000 },

@@ -45,7 +45,14 @@ import { Studio } from './studio/studio.js';
 import { describeSlots, publishReadiness, SLOT_KINDS, type SlotKind } from './studio/artifact.js';
 import type { BrandPack } from './studio/brandpack.js';
 import { HireBroker, hireDigest } from './hire/hire.js';
-import { readBorrowed } from './hire/lock.js';
+import { readBorrowed, writeLock } from './hire/lock.js';
+import {
+  GRANTABLE,
+  NEVER_BY_DEFAULT,
+  grant,
+  grantDigest,
+  isGrantable,
+} from './hire/permissions.js';
 import { parseCloseBlock, type HireRequest } from './org/protocol.js';
 import { ALL_PERSONAS } from './org/personas.js';
 import { checkHealth } from './ops/health.js';
@@ -1374,6 +1381,110 @@ async function cmdHire(argv: string[]): Promise<number> {
     return EXIT_OK;
   }
 
+  /**
+   * 권한 승격·회수 (R13.3).
+   *
+   * **승격은 채용과 별개 결정이다.** 채용 승인이 권한 승인을 겸하지 않는다 —
+   * "이 에이전트를 들인다" 와 "이 에이전트가 무엇을 만질 수 있다" 는 다른
+   * 판단이고, 승인 카드도 따로 나간다. 등급은 L3 이다.
+   *
+   * **회수는 승인을 요구하지 않는다.** 권한을 낮추는 것은 언제나 안전하고,
+   * 여기서 승인을 요구하면 사고가 났을 때 오너가 권한을 못 거두는 상태가
+   * 생긴다 — 승인 거부에 digest 를 요구하지 않는 것과 같은 이유다.
+   */
+  if (sub === 'grant' || sub === 'revoke') {
+    const agentId = argv[2];
+    const wanted = flagValue(argv, '--permission')?.split(',').map((x) => x.trim()).filter(Boolean) ?? [];
+    if (!agentId || agentId.startsWith('--') || wanted.length === 0) {
+      process.stderr.write(
+        `사용법: company hire ${sub} <에이전트ID> --permission ${GRANTABLE.join(',')}\n`,
+      );
+      return EXIT_CANNOT_RUN;
+    }
+
+    const agents = readBorrowed(lockText);
+    const agent = agents.find((a) => a.id === agentId);
+    if (!agent) {
+      process.stderr.write(`차용 목록에 ${agentId} 가 없습니다. company hire list 로 확인하세요.\n`);
+      return EXIT_CANNOT_RUN;
+    }
+
+    const ledger = Ledger.open(ledgerPath(argv));
+
+    if (sub === 'revoke') {
+      const before = agent.permissions.granted;
+      const next = before.filter((g) => !wanted.includes(g));
+      const removed = before.filter((g) => wanted.includes(g));
+      agent.permissions = { granted: next };
+      writeLock(lockFile, agents);
+      ledger.append({
+        actor: { kind: 'owner', id: 'cli' },
+        kind: 'permission.change',
+        summary: `${agentId} 권한 회수 — ${removed.join(', ') || '해당 없음'} (남은 권한: ${next.join(', ') || '없음'})`,
+      });
+      out(`${agentId} 권한 회수`);
+      out(`  거둔 것  ${removed.join(', ') || '해당 없음'}`);
+      out(`  남은 것  ${next.join(', ') || '없음'}`);
+      return EXIT_OK;
+    }
+
+    // **줄 수 없는 권한이 섞이면 카드를 만들기 전에 멈춘다.** 승인은 정확한
+    // 집합에 묶이므로, 일부만 적용하면 오너가 승인한 것과 다른 결과가 된다.
+    const refused = wanted.filter((w) => !isGrantable(w));
+    if (refused.length > 0) {
+      process.stderr.write(`줄 수 없는 권한: ${refused.join(', ')}\n`);
+      for (const r of refused) {
+        process.stderr.write(
+          `  ${(NEVER_BY_DEFAULT as readonly string[]).includes(r)
+            ? `${r} 은 차용 패키지에 부여할 수 없습니다 (R13.3)`
+            : `알 수 없는 권한: ${r}`}\n`,
+        );
+      }
+      process.stderr.write(`  줄 수 있는 것: ${GRANTABLE.join(', ')}\n`);
+      return EXIT_CANNOT_RUN;
+    }
+
+    const digest = grantDigest(agentId, agent.digest, wanted);
+    const { policy } = loadPolicy(policyFile(argv));
+    const { svc } = approvalService(argv);
+    const decision = resolveGate(
+      { policy, approvals: svc, ledger },
+      {
+        action: 'hire.grant',
+        payloadDigest: digest,
+        summary: `${agentId} 권한 승격 — ${wanted.join(', ')}`,
+      },
+    );
+
+    if (!decision.allowed) {
+      out(`권한 승격 거부 — ${decision.reason}`);
+      out(`  등급 ${decision.level}${decision.irreversible ? ' [비가역]' : ''}`);
+      if (decision.approvalId) {
+        out(
+          `  승인: company approvals approve ${decision.approvalId} --digest ${digest}` +
+            (decision.needsStepUp ? ' --step-up <코드>' : ''),
+        );
+      }
+      out('  채용 승인과 별개입니다 — 이 카드는 권한 부여만 승인합니다.');
+      return EXIT_FINDING;
+    }
+
+    const result = grant(agent.permissions, wanted);
+    agent.permissions = result.permissions;
+    writeLock(lockFile, agents);
+    ledger.append({
+      actor: { kind: 'owner', id: 'cli' },
+      kind: 'permission.change',
+      level: decision.level,
+      payloadDigest: digest,
+      summary: `${agentId} 권한 승격 — ${wanted.join(', ')} (전체: ${result.permissions.granted.join(', ')})`,
+    });
+    out(`${agentId} 권한 승격 완료`);
+    out(`  부여    ${wanted.join(', ')}`);
+    out(`  전체    ${result.permissions.granted.join(', ')}`);
+    return EXIT_OK;
+  }
+
   // 요청을 모은다 — 마감 블록 파일 또는 명령줄.
   const requests: HireRequest[] = [];
   const fromFile = flagValue(argv, '--from-meeting');
@@ -2012,6 +2123,8 @@ function usage(): void {
   out('  채용 (R13) — 회의가 결정하고 오너가 L3 로 승인한다');
   out('  company hire --from-meeting <마감블록.txt> | --borrow <패키지> --reason "<사유>"');
   out('  company hire list                차용된 에이전트와 권한');
+  out('  company hire grant <ID> --permission <권한들>   권한 승격 (L3, 채용과 별개 승인)');
+  out('  company hire revoke <ID> --permission <권한들>  권한 회수 (승인 불필요)');
   out('');
   out('  구역·비밀 (R15) — 좌석은 브로커 자산을 보지 못한다');
   out('  company security verify          권한 표와 실제 권한을 대조');
