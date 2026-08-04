@@ -16,6 +16,7 @@ import { readFileSync } from 'node:fs';
 import { Ledger } from './ledger/ledger.js';
 import type { EventKind, QueryFilter } from './ledger/types.js';
 import { SeatBroker } from './seats/broker.js';
+import { SeatUsageStore, exhaustionState, limitEnforceable } from './seats/usage.js';
 import { ALL_SEATS, effectiveConcurrency } from './seats/spec.js';
 import { distinctVendors, providerFor } from './seats/providers.js';
 import { createProfile } from './seats/profile.js';
@@ -133,12 +134,42 @@ function ledgerPath(argv: string[]): string {
   return flagValue(argv, '--ledger') ?? join(resolveState(), 'events.jsonl');
 }
 
+/**
+ * 터미널에서 차지하는 칸 수.
+ *
+ * 한글·한자·가나는 고정폭 터미널에서 두 칸이다. `String.length` 로 폭을
+ * 맞추면 한글이 섞인 셀마다 표가 어긋난다.
+ */
+export function cellWidth(s: string): number {
+  let w = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    const wide =
+      (c >= 0x1100 && c <= 0x115f) || // 한글 자모
+      (c >= 0x2e80 && c <= 0xa4cf) || // CJK 부수 ~ 이(Yi)
+      (c >= 0xac00 && c <= 0xd7a3) || // 한글 음절
+      (c >= 0xf900 && c <= 0xfaff) || // CJK 호환 한자
+      (c >= 0xfe30 && c <= 0xfe6f) ||
+      (c >= 0xff00 && c <= 0xff60) || // 전각
+      (c >= 0xffe0 && c <= 0xffe6);
+    w += wide ? 2 : 1;
+  }
+  return w;
+}
+
+function padCell(s: string, width: number): string {
+  return s + ' '.repeat(Math.max(1, width - cellWidth(s)));
+}
+
 /** 좌석 현황. 실측되지 않은 것은 unknown 으로 보인다. */
 function cmdSeats(argv: string[]): number {
+  const usage = new SeatUsageStore();
+  const now = Date.now();
   const rows = ALL_SEATS.map((spec) => {
     const profile = createProfile(spec);
     const isolated = profile.isolated;
     profile.dispose();
+    const u = usage.get(spec.id, spec);
     return {
       seat: spec.id,
       vendor: spec.vendor,
@@ -150,6 +181,12 @@ function cmdSeats(argv: string[]): number {
       quotaWindow: spec.quota.window,
       quotaLimit: spec.quota.limit,
       quotaResetAt: spec.quota.resetAt,
+      // 장부에서 읽은 실제 사용량 (Task 5.1). 프로세스가 바뀌어도 남는다.
+      used: u.used,
+      windowKey: u.windowKey,
+      limitEnforced: limitEnforceable(spec, now),
+      exhaustion: exhaustionState(u, now),
+      exhaustedUntil: u.exhaustedUntil,
       maxConcurrent: spec.maxConcurrent,
       effectiveConcurrent: effectiveConcurrency(spec),
       note: spec.note ?? null,
@@ -169,19 +206,36 @@ function cmdSeats(argv: string[]): number {
     return rows.some((r) => r.verified) ? EXIT_OK : EXIT_FINDING;
   }
 
-  out('좌석      벤더        인증    검증   격리          쿼터창    한도');
-  out('-'.repeat(76));
-  for (const r of rows) {
-    const cells = [
-      r.seat.padEnd(9),
-      r.vendor.padEnd(11),
-      r.auth.padEnd(7),
-      (r.verified ? 'yes' : 'no').padEnd(6),
-      (r.isolationWorks ? r.isolation : `${r.isolation}(미적용)`).padEnd(13),
-      r.quotaWindow.padEnd(9),
-      String(r.quotaLimit ?? 'unknown'),
-    ];
-    out(cells.join(''));
+  // 폭은 내용에서 계산한다. 고정 폭은 `CODEX_HOME(미적용)` 같은 긴 셀에서
+  // 밀려 다음 칸을 삼키고, 한글은 터미널에서 두 칸이라 글자 수로 맞추면 어긋난다.
+  const table = [
+    ['좌석', '벤더', '인증', '검증', '격리', '쿼터창', '한도', '사용'],
+    ...rows.map((r) => [
+      r.seat,
+      r.vendor,
+      r.auth,
+      r.verified ? 'yes' : 'no',
+      r.isolationWorks ? r.isolation : `${r.isolation}(미적용)`,
+      r.quotaWindow,
+      // 한도가 있어도 창 경계를 못 잡으면 집행되지 않는다. 그 사실을 숨기지 않는다
+      r.quotaLimit === null
+        ? 'unknown'
+        : r.limitEnforced
+          ? String(r.quotaLimit)
+          : `${String(r.quotaLimit)}(미집행)`,
+      String(r.used),
+    ]),
+  ];
+  const widths = table[0]!.map((_, i) => Math.max(...table.map((row) => cellWidth(row[i] ?? ''))) + 2);
+  out(table[0]!.map((c, i) => padCell(c, widths[i]!)).join('').trimEnd());
+  out('-'.repeat(widths.reduce((a, b) => a + b, 0)));
+  for (const [i, r] of rows.entries()) {
+    out(table[i + 1]!.map((c, j) => padCell(c, widths[j]!)).join('').trimEnd());
+    if (r.exhaustion.kind === 'excluded') {
+      out(`          └ 쿼터 소진 — ${r.exhaustion.until} 이후 재시도`);
+    } else if (r.exhaustion.kind === 'demoted') {
+      out('          └ 쿼터 소진, 해제 시각 미상 — 배제하지 않고 후순위로 민다');
+    }
     if (r.note) out(`          └ ${r.note}`);
   }
   const verified = rows.filter((r) => r.verified).length;
@@ -206,7 +260,7 @@ async function cmdAsk(argv: string[]): Promise<number> {
   }
 
   const ledger = Ledger.open(ledgerPath(argv));
-  const broker = new SeatBroker({ ledger });
+  const broker = seatBroker(ledger);
   const seat = flagValue(argv, '--seat');
   const forbid = flagValue(argv, '--forbid-vendor');
 
@@ -531,10 +585,35 @@ function metricsBroker(ledger: Ledger, opts: { statsUrl?: string } = {}): Metric
   });
 }
 
+/**
+ * 좌석 브로커. 사용량 장부를 반드시 물린다 (Task 5.1).
+ *
+ * `company` 는 부를 때마다 새 프로세스다. 장부 없이 만들면 카운터가 매번
+ * 0 에서 시작하고 벤더가 알려 준 소진 사실도 매번 잊혀, 다음 호출이 같은
+ * 벽에 다시 부딪친다. CLI 경로에서 장부를 빼먹을 수 있는 자리를 없애려고
+ * 브로커 생성을 여기 한 곳으로 모은다.
+ */
+function seatBroker(ledger: Ledger): SeatBroker {
+  return new SeatBroker({
+    ledger,
+    usage: new SeatUsageStore({
+      onCorrupt: (file) => {
+        // 조용히 넘어가지 않는다. 카운터가 리셋됐다는 사실 자체가 신호다.
+        ledger.append({
+          actor: { kind: 'system', id: 'seat-broker' },
+          kind: 'deny',
+          summary: `좌석 사용량 장부가 손상됐다 — 빈 장부로 시작한다 (${file})`,
+        });
+        note(`  경고: 좌석 사용량 장부 손상. 카운터가 0 부터 다시 센다 (${file})`);
+      },
+    }),
+  });
+}
+
 function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalService } {
   const { policy } = loadPolicy(policyFile(argv));
   const ledger = Ledger.open(ledgerPath(argv));
-  const broker = new SeatBroker({ ledger });
+  const broker = seatBroker(ledger);
   const approvals = new ApprovalService({
     policy,
     ledger,
@@ -670,7 +749,7 @@ async function cmdMeeting(argv: string[]): Promise<number> {
 
   const attendees = (flagValue(argv, '--attendees') ?? 'cto,growth').split(',').map((s) => s.trim());
   const ledger = Ledger.open(ledgerPath(argv));
-  const broker = new SeatBroker({ ledger });
+  const broker = seatBroker(ledger);
   const companyctl = flagValue(argv, '--companyctl');
 
   const meeting = new Meeting({
@@ -1312,7 +1391,7 @@ async function cmdStudio(argv: string[]): Promise<number> {
   }
 
   const ledger = Ledger.open(ledgerPath(argv));
-  const studio = new Studio({ broker: new SeatBroker({ ledger }), ledger, pack });
+  const studio = new Studio({ broker: seatBroker(ledger), ledger, pack });
   const artifact = await studio.produce({
     title,
     brief,

@@ -29,6 +29,18 @@ export interface QuotaWindow {
   limit: number | null;
   /** 예: '20:00 Asia/Seoul' — claude 실측값. */
   resetAt: string | null;
+  /**
+   * 주간 창이 넘어가는 요일 (0=일요일). 주간 창에서만 의미가 있다.
+   *
+   * claude 실측 문구는 `resets 8pm (Asia/Seoul)` 까지만 알려 주고 **요일은
+   * 말하지 않는다**. 그래서 실측 전에는 null 이고, null 이면 주간 창의
+   * 경계를 계산할 수 없다 — `usage.ts` 가 그 좌석의 카운터를 리셋하지 않고
+   * 한도도 집행하지 않는다.
+   *
+   * 한도(`limit`)를 채워 넣으려면 이 값이 먼저 있어야 한다.
+   * `assertQuotaCoherent` 가 그 순서를 강제한다.
+   */
+  resetDay?: number | null;
 }
 
 export interface SeatSpec {
