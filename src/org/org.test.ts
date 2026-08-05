@@ -336,3 +336,104 @@ describe('회의 실행', () => {
     expect(ledger.verify().ok).toBe(true);
   });
 });
+
+/**
+ * R3.7 은 트리거가 둘인데("동일 과제 2회 실패" 또는 "Critic BLOCK") 뒤쪽만
+ * 구현돼 있었다. `MeetingOptions.stateDir` 주석은 "실패 카운터가 여기 쓰인다"
+ * 고 약속했지만 그 카운터를 쓰는 코드가 없었다 — 메모리에 있던 것이 아니라
+ * 아예 없었고, 같은 안건이 몇 번을 실패하든 오너에게 올라가지 않았다.
+ *
+ * 아래에서 새 `Meeting` 인스턴스가 새 프로세스의 대역이다. 회의는 매번 새
+ * 프로세스에서 돌므로, 카운터가 프로세스 안에 있으면 "2회 연속" 이 성립할 수 없다.
+ */
+describe('동일 과제 2회 실패 → War Room (Task 6.2, R3.7)', () => {
+  /** 1라운드에서 아무 발언도 못 받는 회의. 실패 경로다. */
+  function failing(): Meeting {
+    const broker = new SeatBroker({
+      ledger,
+      seats: [fakeSeat('codex', 'openai'), fakeSeat('claude', 'anthropic')],
+      runner: async () => ({ code: 1, stdout: '', stderr: '', timedOut: false, ms: 2 }),
+    });
+    return new Meeting({ ledger, broker, stateDir: dir });
+  }
+
+  const AGENDA = '가격 정책을 정하자';
+
+  it('첫 실패는 실패다', async () => {
+    const r = await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r1' });
+    expect(r.status).toBe('failed');
+    expect(r.failureStreak).toBe(1);
+  });
+
+  it('다른 프로세스의 두 번째 실패가 War Room 을 부른다', async () => {
+    await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r1' });
+    const r = await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r2' });
+    expect(r.status).toBe('war-room');
+    expect(r.warRoomCause).toBe('repeat-failure');
+    expect(r.failureStreak).toBe(2);
+  });
+
+  it('다른 안건은 따로 센다', async () => {
+    await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r1' });
+    const r = await failing().run({ agenda: '채용 계획', attendees: ['cto'], runId: 'r2' });
+    expect(r.status).toBe('failed');
+    expect(r.failureStreak).toBe(1);
+  });
+
+  /**
+   * 끊지 않으면 한 번 어긋난 안건이 다음 실패마다 영구히 경보를 낸다.
+   */
+  it('소집하면 연속이 끊긴다', async () => {
+    await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r1' });
+    await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r2' }); // War Room
+    const r = await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r3' });
+    expect(r.status).toBe('failed');
+    expect(r.failureStreak).toBe(1);
+  });
+
+  /**
+   * 몇 달 전 실패 한 번이 다음 실패와 이어지면 엉뚱한 시점에 소집된다.
+   */
+  it('성공하면 연속이 끊긴다', async () => {
+    await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r1' });
+
+    const okBroker = new SeatBroker({
+      ledger,
+      seats: [fakeSeat('codex', 'openai'), fakeSeat('claude', 'anthropic')],
+      runner: scriptedRunner({
+        'VERDICT: CLEAR | WATCH | BLOCK': 'VERDICT: CLEAR',
+        '너는 CEO': CLOSE_BLOCK,
+      }),
+    });
+    const okRun = await new Meeting({ ledger, broker: okBroker, stateDir: dir }).run({
+      agenda: AGENDA, attendees: ['cto'], runId: 'r2',
+    });
+    expect(okRun.status).toBe('closed');
+
+    const r = await failing().run({ agenda: AGENDA, attendees: ['cto'], runId: 'r3' });
+    expect(r.failureStreak).toBe(1);
+  });
+
+  it('Critic BLOCK 과 반복 실패를 구분해 남긴다', async () => {
+    const blockBroker = new SeatBroker({
+      ledger,
+      seats: [fakeSeat('codex', 'openai'), fakeSeat('claude', 'anthropic')],
+      runner: scriptedRunner({
+        'VERDICT: CLEAR | WATCH | BLOCK': 'VERDICT: BLOCK\nBLOCKERS:\n- 근거 없음',
+        '너는 CEO': CLOSE_BLOCK,
+      }),
+    });
+    const r = await new Meeting({ ledger, broker: blockBroker, stateDir: dir }).run({
+      agenda: AGENDA, attendees: ['cto'], runId: 'r1',
+    });
+    expect(r.status).toBe('war-room');
+    expect(r.warRoomCause).toBe('critic-block');
+  });
+
+  it('원장에 안건 원문을 남기지 않는다 (R9)', async () => {
+    await failing().run({ agenda: '영업비밀 프로젝트 X 인수', attendees: ['cto'], runId: 'r1' });
+    const raw = JSON.stringify(ledger.query({}));
+    expect(raw).not.toContain('영업비밀');
+    expect(raw).toContain('동일 과제 연속 1회');
+  });
+});

@@ -21,6 +21,7 @@ import { runShell } from '../proc/index.js';
 import type { SeatBroker } from '../seats/broker.js';
 import type { Vendor } from '../seats/spec.js';
 import { CEO, CRITIC, personaById, type Persona, type PersonaId } from './personas.js';
+import { agendaKey, failuresFile, FailureStore, WAR_ROOM_THRESHOLD } from './failures.js';
 import {
   isCriticalDissent,
   parseCloseBlock,
@@ -40,6 +41,17 @@ export interface Turn {
 
 export type MeetingStatus = 'closed' | 'board-gate' | 'war-room' | 'failed';
 
+/**
+ * War Room 이 왜 열렸는가 (R3.7).
+ *
+ *   critic-block     Critic 이 BLOCK 을 냈다
+ *   repeat-failure   동일 과제가 문턱 횟수만큼 연속 실패했다
+ *
+ * 오너가 볼 화면과 할 일이 다르다. 하나로 뭉치면 "무엇이 막혔는지" 를
+ * 원장에서 다시 파헤쳐야 한다.
+ */
+export type WarRoomCause = 'critic-block' | 'repeat-failure';
+
 export interface MeetingResult {
   status: MeetingStatus;
   runId: string;
@@ -52,6 +64,10 @@ export interface MeetingResult {
   /** 업스트림 정규화를 건너뛴 이유. */
   normalizationSkipped?: string;
   reason?: string;
+  /** `status: 'war-room'` 일 때만 채워진다. */
+  warRoomCause?: WarRoomCause;
+  /** 이 안건의 연속 실패 횟수. 실패·소집 판단의 근거를 그대로 노출한다. */
+  failureStreak?: number;
 }
 
 export interface Seating {
@@ -67,6 +83,13 @@ export interface MeetingOptions {
   /** `companyctl.py` 경로. 없으면 업스트림 정규화를 건너뛴다. */
   companyctl?: string;
   timeoutMs?: number;
+  /**
+   * 동일 과제 연속 실패 장부 (R3.7). 주지 않으면 `stateDir` 아래에 만든다.
+   *
+   * 회의는 매번 새 프로세스에서 돌므로 이 카운터는 반드시 프로세스 밖에
+   * 있어야 한다 — 안에 두면 "2회 연속" 이 성립할 수가 없다.
+   */
+  failures?: FailureStore;
 }
 
 export interface MeetingRequest {
@@ -110,6 +133,7 @@ export class Meeting {
   private readonly stateDir: string;
   private readonly companyctl: string | undefined;
   private readonly timeoutMs: number;
+  private readonly failures: FailureStore;
 
   constructor(opts: MeetingOptions) {
     this.ledger = opts.ledger;
@@ -117,6 +141,7 @@ export class Meeting {
     this.stateDir = opts.stateDir;
     this.companyctl = opts.companyctl;
     this.timeoutMs = opts.timeoutMs ?? 300_000;
+    this.failures = opts.failures ?? new FailureStore({ file: failuresFile(opts.stateDir) });
   }
 
   async run(req: MeetingRequest): Promise<MeetingResult> {
@@ -179,6 +204,11 @@ export class Meeting {
       ...(norm.skipped !== undefined ? { normalizationSkipped: norm.skipped } : {}),
     };
 
+    // 여기까지 왔으면 이 안건은 마감 블록까지 만들어졌다. 연속 실패가
+    // 끊긴 것이고, 끊지 않으면 몇 달 전 실패 한 번이 다음 실패와 이어져
+    // 엉뚱한 시점에 War Room 을 부른다.
+    this.failures.clear(req.agenda);
+
     // R3.5 / R3.7 — BLOCK 은 다수결로 기각되지 않는다
     if (isCriticalDissent(verdict)) {
       this.ledger.append({
@@ -190,7 +220,12 @@ export class Meeting {
           `Critic BLOCK — War Room 소집. 다수결로 기각하지 않는다. ` +
           `오너만 종결할 수 있다. 사유 ${verdict.blockers.length}건`,
       });
-      return { ...base, status: 'war-room', reason: verdict.blockers.join(' / ') };
+      return {
+        ...base,
+        status: 'war-room',
+        reason: verdict.blockers.join(' / '),
+        warRoomCause: 'critic-block',
+      };
     }
 
     this.ledger.append({
@@ -298,14 +333,50 @@ export class Meeting {
     }
   }
 
+  /**
+   * 회의 실패를 기록하고, 문턱에 닿으면 War Room 으로 올린다 (R3.7 전반부).
+   *
+   * 문턱에 닿으면 연속을 끊는다. 그대로 두면 다음 실패 한 번에 즉시 다시
+   * 소집되어, 한 번 어긋난 안건이 영구히 경보를 낸다.
+   */
   private fail(req: MeetingRequest, reason: string): MeetingResult {
+    const streak = this.failures.recordFailure(req.agenda, req.runId);
+
     this.ledger.append({
       actor: { kind: 'system', id: 'meeting' },
       kind: 'deny',
       runId: req.runId,
-      summary: `회의 실패 — ${reason}`,
+      // 안건 원문은 남기지 않는다 (R9). digest 앞자리로 같은 과제임을 대조한다.
+      payloadDigest: agendaKey(req.agenda),
+      summary: `회의 실패 (동일 과제 연속 ${streak.count}회) — ${reason}`,
     });
-    return { status: 'failed', runId: req.runId, round1: [], round2: [], reason };
+
+    if (streak.count < WAR_ROOM_THRESHOLD) {
+      return { status: 'failed', runId: req.runId, round1: [], round2: [], reason, failureStreak: streak.count };
+    }
+
+    this.failures.clear(req.agenda);
+    this.ledger.append({
+      actor: { kind: 'system', id: 'meeting' },
+      kind: 'decision',
+      runId: req.runId,
+      level: 'L3',
+      payloadDigest: agendaKey(req.agenda),
+      summary:
+        `동일 과제 ${streak.count}회 연속 실패 — War Room 소집. 오너만 종결할 수 있다. ` +
+        `직전 실패 ${streak.lastRunId}`,
+    });
+    return {
+      status: 'war-room',
+      runId: req.runId,
+      round1: [],
+      round2: [],
+      // 사유만 담는다. 횟수는 `failureStreak` 이, 무엇 때문인지는
+      // `warRoomCause` 가 말한다 — 한 문장에 세 번 되풀이하지 않는다.
+      reason,
+      warRoomCause: 'repeat-failure',
+      failureStreak: streak.count,
+    };
   }
 }
 

@@ -80,6 +80,7 @@ import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
 import { randomUUID } from 'node:crypto';
 import { Meeting } from './org/meeting.js';
+import { WAR_ROOM_THRESHOLD } from './org/failures.js';
 import { RecipeEngine } from './recipes/engine.js';
 import { loadRecipe } from './recipes/load.js';
 import type { Recipe, RetroStep } from './recipes/types.js';
@@ -811,13 +812,25 @@ async function cmdMeeting(argv: string[]): Promise<number> {
 
   if (result.status === 'war-room') {
     out('');
-    out('War Room 소집 — Critic 이 BLOCK 했습니다. 다수결로 기각되지 않습니다.');
+    // 두 트리거는 오너가 할 일이 다르다 (R3.7). 뭉치면 원장을 다시 파야 한다.
+    out(
+      result.warRoomCause === 'repeat-failure'
+        ? `War Room 소집 — 동일 과제가 ${String(result.failureStreak ?? WAR_ROOM_THRESHOLD)}회 연속 실패했습니다.`
+        : 'War Room 소집 — Critic 이 BLOCK 했습니다. 다수결로 기각되지 않습니다.',
+    );
     out(`사유: ${result.reason}`);
     out('오너만 종결할 수 있습니다.');
   }
   if (result.status === 'failed') {
     out('');
     out(`실패: ${result.reason}`);
+    if (result.failureStreak !== undefined) {
+      const left = WAR_ROOM_THRESHOLD - result.failureStreak;
+      out(
+        `동일 과제 연속 실패 ${result.failureStreak}회` +
+          (left > 0 ? ` — ${left}회 더 실패하면 War Room 이 열립니다.` : ''),
+      );
+    }
   }
 
   return result.status === 'closed' ? EXIT_OK : EXIT_FINDING;
