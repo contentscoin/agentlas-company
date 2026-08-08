@@ -16,6 +16,7 @@ import { readFileSync } from 'node:fs';
 import { Ledger } from './ledger/ledger.js';
 import type { EventKind, QueryFilter } from './ledger/types.js';
 import { SeatBroker } from './seats/broker.js';
+import { SeatUsageStore, exhaustionState, limitEnforceable } from './seats/usage.js';
 import { ALL_SEATS, effectiveConcurrency } from './seats/spec.js';
 import { distinctVendors, providerFor } from './seats/providers.js';
 import { createProfile } from './seats/profile.js';
@@ -79,6 +80,8 @@ import { ApprovalService } from './policy/approval.js';
 import type { Submitter } from './policy/types.js';
 import { randomUUID } from 'node:crypto';
 import { Meeting } from './org/meeting.js';
+import { WAR_ROOM_THRESHOLD } from './org/failures.js';
+import { WarRoomError, WarRoomStore, warRoomsFile } from './org/warroom.js';
 import { RecipeEngine } from './recipes/engine.js';
 import { loadRecipe } from './recipes/load.js';
 import type { Recipe, RetroStep } from './recipes/types.js';
@@ -133,12 +136,42 @@ function ledgerPath(argv: string[]): string {
   return flagValue(argv, '--ledger') ?? join(resolveState(), 'events.jsonl');
 }
 
+/**
+ * 터미널에서 차지하는 칸 수.
+ *
+ * 한글·한자·가나는 고정폭 터미널에서 두 칸이다. `String.length` 로 폭을
+ * 맞추면 한글이 섞인 셀마다 표가 어긋난다.
+ */
+export function cellWidth(s: string): number {
+  let w = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    const wide =
+      (c >= 0x1100 && c <= 0x115f) || // 한글 자모
+      (c >= 0x2e80 && c <= 0xa4cf) || // CJK 부수 ~ 이(Yi)
+      (c >= 0xac00 && c <= 0xd7a3) || // 한글 음절
+      (c >= 0xf900 && c <= 0xfaff) || // CJK 호환 한자
+      (c >= 0xfe30 && c <= 0xfe6f) ||
+      (c >= 0xff00 && c <= 0xff60) || // 전각
+      (c >= 0xffe0 && c <= 0xffe6);
+    w += wide ? 2 : 1;
+  }
+  return w;
+}
+
+function padCell(s: string, width: number): string {
+  return s + ' '.repeat(Math.max(1, width - cellWidth(s)));
+}
+
 /** 좌석 현황. 실측되지 않은 것은 unknown 으로 보인다. */
 function cmdSeats(argv: string[]): number {
+  const usage = new SeatUsageStore();
+  const now = Date.now();
   const rows = ALL_SEATS.map((spec) => {
     const profile = createProfile(spec);
     const isolated = profile.isolated;
     profile.dispose();
+    const u = usage.get(spec.id, spec);
     return {
       seat: spec.id,
       vendor: spec.vendor,
@@ -150,6 +183,12 @@ function cmdSeats(argv: string[]): number {
       quotaWindow: spec.quota.window,
       quotaLimit: spec.quota.limit,
       quotaResetAt: spec.quota.resetAt,
+      // 장부에서 읽은 실제 사용량 (Task 5.1). 프로세스가 바뀌어도 남는다.
+      used: u.used,
+      windowKey: u.windowKey,
+      limitEnforced: limitEnforceable(spec, now),
+      exhaustion: exhaustionState(u, now),
+      exhaustedUntil: u.exhaustedUntil,
       maxConcurrent: spec.maxConcurrent,
       effectiveConcurrent: effectiveConcurrency(spec),
       note: spec.note ?? null,
@@ -169,19 +208,36 @@ function cmdSeats(argv: string[]): number {
     return rows.some((r) => r.verified) ? EXIT_OK : EXIT_FINDING;
   }
 
-  out('좌석      벤더        인증    검증   격리          쿼터창    한도');
-  out('-'.repeat(76));
-  for (const r of rows) {
-    const cells = [
-      r.seat.padEnd(9),
-      r.vendor.padEnd(11),
-      r.auth.padEnd(7),
-      (r.verified ? 'yes' : 'no').padEnd(6),
-      (r.isolationWorks ? r.isolation : `${r.isolation}(미적용)`).padEnd(13),
-      r.quotaWindow.padEnd(9),
-      String(r.quotaLimit ?? 'unknown'),
-    ];
-    out(cells.join(''));
+  // 폭은 내용에서 계산한다. 고정 폭은 `CODEX_HOME(미적용)` 같은 긴 셀에서
+  // 밀려 다음 칸을 삼키고, 한글은 터미널에서 두 칸이라 글자 수로 맞추면 어긋난다.
+  const table = [
+    ['좌석', '벤더', '인증', '검증', '격리', '쿼터창', '한도', '사용'],
+    ...rows.map((r) => [
+      r.seat,
+      r.vendor,
+      r.auth,
+      r.verified ? 'yes' : 'no',
+      r.isolationWorks ? r.isolation : `${r.isolation}(미적용)`,
+      r.quotaWindow,
+      // 한도가 있어도 창 경계를 못 잡으면 집행되지 않는다. 그 사실을 숨기지 않는다
+      r.quotaLimit === null
+        ? 'unknown'
+        : r.limitEnforced
+          ? String(r.quotaLimit)
+          : `${String(r.quotaLimit)}(미집행)`,
+      String(r.used),
+    ]),
+  ];
+  const widths = table[0]!.map((_, i) => Math.max(...table.map((row) => cellWidth(row[i] ?? ''))) + 2);
+  out(table[0]!.map((c, i) => padCell(c, widths[i]!)).join('').trimEnd());
+  out('-'.repeat(widths.reduce((a, b) => a + b, 0)));
+  for (const [i, r] of rows.entries()) {
+    out(table[i + 1]!.map((c, j) => padCell(c, widths[j]!)).join('').trimEnd());
+    if (r.exhaustion.kind === 'excluded') {
+      out(`          └ 쿼터 소진 — ${r.exhaustion.until} 이후 재시도`);
+    } else if (r.exhaustion.kind === 'demoted') {
+      out('          └ 쿼터 소진, 해제 시각 미상 — 배제하지 않고 후순위로 민다');
+    }
     if (r.note) out(`          └ ${r.note}`);
   }
   const verified = rows.filter((r) => r.verified).length;
@@ -206,7 +262,7 @@ async function cmdAsk(argv: string[]): Promise<number> {
   }
 
   const ledger = Ledger.open(ledgerPath(argv));
-  const broker = new SeatBroker({ ledger });
+  const broker = seatBroker(ledger);
   const seat = flagValue(argv, '--seat');
   const forbid = flagValue(argv, '--forbid-vendor');
 
@@ -401,6 +457,91 @@ function reportStepUpFailure(argv: string[], f: Extract<StepUpOutcome, { ok: fal
   return EXIT_CANNOT_RUN;
 }
 
+/**
+ * War Room — 목록과 종결 (R3.7).
+ *
+ * 종결은 오너만 한다. CLI 에서도 오피스 API 와 같은 문턱을 둔다 —
+ * 단계별 인증과 사유. 한쪽이 느슨하면 느슨한 쪽이 실질 규칙이 된다.
+ */
+function cmdWarRoom(argv: string[]): number {
+  const store = warRoomStore();
+  // `argv[1]` 을 그대로 쓰면 `company warroom --json` 이 `--json` 을 하위
+  // 명령으로 읽는다. 실제로 그렇게 실패했다.
+  const sub = subcommand(argv);
+
+  if (sub === undefined || sub === 'list') {
+    const all = store.list();
+    const open = all.filter((r) => r.closedAt === null);
+    if (hasFlag(argv, '--json')) {
+      jsonOut({ open, closed: all.filter((r) => r.closedAt !== null) });
+      return open.length > 0 ? EXIT_FINDING : EXIT_OK;
+    }
+    if (open.length === 0) {
+      out('열린 War Room 없음');
+      return EXIT_OK;
+    }
+    for (const r of open) {
+      const why = r.cause === 'critic-block' ? 'Critic BLOCK' : '동일 과제 반복 실패';
+      out(`${r.id}  ${why}`);
+      out(`    ${r.subject}`);
+      out(`    ${r.reason}`);
+      out(`    소집 ${r.openedAt} · run ${r.runId}`);
+      out(`    company warroom close ${r.id} --reason "<확인한 것>" --step-up <코드>`);
+    }
+    // 열린 방이 있으면 정상 종료가 아니다. 스케줄러가 이 값을 본다.
+    return EXIT_FINDING;
+  }
+
+  if (sub !== 'close') {
+    process.stderr.write(`알 수 없는 하위 명령: ${sub}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const id = argv[2];
+  if (!id) {
+    process.stderr.write('War Room id 가 필요합니다.\n');
+    return EXIT_CANNOT_RUN;
+  }
+  const reason = flagValue(argv, '--reason');
+  if (!reason || reason.trim() === '') {
+    process.stderr.write(
+      '--reason 은 필수입니다. 사유 없는 종결은 목록에서 지우는 것과 같습니다.\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  // 종결은 통제 승격을 푸는 행위다. 승인 L3 과 같은 문턱을 둔다.
+  const step = resolveStepUp(argv);
+  if (!step.ok) return reportStepUpFailure(argv, step);
+  if (!step.stepUp) {
+    process.stderr.write(
+      'War Room 종결에는 --step-up <코드> 가 필요합니다. 오너만 종결할 수 있습니다 (R3.7).\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  try {
+    const closed = store.close(id, `cli:${step.device}`, reason);
+    Ledger.open(ledgerPath(argv)).append({
+      actor: { kind: 'owner', id: `cli:${step.device}` },
+      kind: 'decision',
+      runId: closed.runId,
+      level: 'L3',
+      payloadDigest: closed.agendaDigest,
+      summary: `War Room ${closed.id} 종결 (${closed.cause}) — ${step.device}`,
+    });
+    out(`War Room ${closed.id} 종결`);
+    out(`  사유: ${closed.resolution ?? ''}`);
+    return EXIT_OK;
+  } catch (err) {
+    if (err instanceof WarRoomError) {
+      process.stderr.write(`종결 실패: ${err.message}\n`);
+      return EXIT_FINDING;
+    }
+    throw err;
+  }
+}
+
 /** 오너 신원. 단계별 인증은 `resolveStepUp` 이 판정한 결과를 받는다. */
 function ownerCaller(argv: string[], step?: Extract<StepUpOutcome, { ok: true }>): Caller {
   return {
@@ -517,6 +658,11 @@ function metricsStore(): MetricsStore {
   return new MetricsStore({ file: join(resolveState(), 'metrics', 'records.json') });
 }
 
+/** 열린 War Room 장부 (R3.7). 회의와 오피스가 같은 파일을 본다. */
+function warRoomStore(): WarRoomStore {
+  return new WarRoomStore({ file: warRoomsFile(resolveState()) });
+}
+
 function metricsBroker(ledger: Ledger, opts: { statsUrl?: string } = {}): MetricsBroker {
   return new MetricsBroker({
     ledger,
@@ -531,10 +677,35 @@ function metricsBroker(ledger: Ledger, opts: { statsUrl?: string } = {}): Metric
   });
 }
 
+/**
+ * 좌석 브로커. 사용량 장부를 반드시 물린다 (Task 5.1).
+ *
+ * `company` 는 부를 때마다 새 프로세스다. 장부 없이 만들면 카운터가 매번
+ * 0 에서 시작하고 벤더가 알려 준 소진 사실도 매번 잊혀, 다음 호출이 같은
+ * 벽에 다시 부딪친다. CLI 경로에서 장부를 빼먹을 수 있는 자리를 없애려고
+ * 브로커 생성을 여기 한 곳으로 모은다.
+ */
+function seatBroker(ledger: Ledger): SeatBroker {
+  return new SeatBroker({
+    ledger,
+    usage: new SeatUsageStore({
+      onCorrupt: (file) => {
+        // 조용히 넘어가지 않는다. 카운터가 리셋됐다는 사실 자체가 신호다.
+        ledger.append({
+          actor: { kind: 'system', id: 'seat-broker' },
+          kind: 'deny',
+          summary: `좌석 사용량 장부가 손상됐다 — 빈 장부로 시작한다 (${file})`,
+        });
+        note(`  경고: 좌석 사용량 장부 손상. 카운터가 0 부터 다시 센다 (${file})`);
+      },
+    }),
+  });
+}
+
 function engineFor(argv: string[]): { engine: RecipeEngine; approvals: ApprovalService } {
   const { policy } = loadPolicy(policyFile(argv));
   const ledger = Ledger.open(ledgerPath(argv));
-  const broker = new SeatBroker({ ledger });
+  const broker = seatBroker(ledger);
   const approvals = new ApprovalService({
     policy,
     ledger,
@@ -670,7 +841,7 @@ async function cmdMeeting(argv: string[]): Promise<number> {
 
   const attendees = (flagValue(argv, '--attendees') ?? 'cto,growth').split(',').map((s) => s.trim());
   const ledger = Ledger.open(ledgerPath(argv));
-  const broker = new SeatBroker({ ledger });
+  const broker = seatBroker(ledger);
   const companyctl = flagValue(argv, '--companyctl');
 
   const meeting = new Meeting({
@@ -732,13 +903,29 @@ async function cmdMeeting(argv: string[]): Promise<number> {
 
   if (result.status === 'war-room') {
     out('');
-    out('War Room 소집 — Critic 이 BLOCK 했습니다. 다수결로 기각되지 않습니다.');
+    // 두 트리거는 오너가 할 일이 다르다 (R3.7). 뭉치면 원장을 다시 파야 한다.
+    out(
+      result.warRoomCause === 'repeat-failure'
+        ? `War Room 소집 — 동일 과제가 ${String(result.failureStreak ?? WAR_ROOM_THRESHOLD)}회 연속 실패했습니다.`
+        : 'War Room 소집 — Critic 이 BLOCK 했습니다. 다수결로 기각되지 않습니다.',
+    );
     out(`사유: ${result.reason}`);
     out('오너만 종결할 수 있습니다.');
+    if (result.warRoomId) {
+      out(`  War Room ${result.warRoomId} — 종결하기 전까지 열린 채로 남습니다.`);
+      out(`  종결: company warroom close ${result.warRoomId} --reason "<확인한 것>" --step-up <코드>`);
+    }
   }
   if (result.status === 'failed') {
     out('');
     out(`실패: ${result.reason}`);
+    if (result.failureStreak !== undefined) {
+      const left = WAR_ROOM_THRESHOLD - result.failureStreak;
+      out(
+        `동일 과제 연속 실패 ${result.failureStreak}회` +
+          (left > 0 ? ` — ${left}회 더 실패하면 War Room 이 열립니다.` : ''),
+      );
+    }
   }
 
   return result.status === 'closed' ? EXIT_OK : EXIT_FINDING;
@@ -1046,6 +1233,7 @@ async function cmdOffice(argv: string[]): Promise<number> {
     // 통과시키던 자리를 거부가 대신한다 (Task 8.1).
     stepUp: enrolledAny ? totp : new RefuseAllStepUp(),
     metricsStore: metricsStore(),
+    warRooms: warRoomStore(),
     host,
     port,
   });
@@ -1312,7 +1500,7 @@ async function cmdStudio(argv: string[]): Promise<number> {
   }
 
   const ledger = Ledger.open(ledgerPath(argv));
-  const studio = new Studio({ broker: new SeatBroker({ ledger }), ledger, pack });
+  const studio = new Studio({ broker: seatBroker(ledger), ledger, pack });
   const artifact = await studio.produce({
     title,
     brief,
@@ -2080,6 +2268,8 @@ function usage(): void {
   out('');
   out('  정책과 승인 (R4)');
   out('  company classify <작업> [--tainted] [--critic BLOCK] [--sei-risk]');
+  out('  company warroom                     열린 War Room (R3.7)');
+  out('  company warroom close <id> --reason "<확인한 것>" --step-up <코드>');
   out('  company approvals                   대기 중인 승인 카드');
   out('  company approvals approve <id> --digest <d> [--step-up <코드>] [--device 기기ID]');
   out('  company approvals reject <id> [--reason 사유]');
@@ -2190,6 +2380,8 @@ async function main(): Promise<number> {
         return cmdSchedule(argv);
       case 'meeting':
         return await cmdMeeting(argv);
+      case 'warroom':
+        return cmdWarRoom(argv);
       case undefined:
       case '-h':
       case '--help':

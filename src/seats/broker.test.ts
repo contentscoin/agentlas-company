@@ -6,6 +6,7 @@ import { Ledger } from '../ledger/ledger.js';
 import { SeatBroker, looksExhausted } from './broker.js';
 import type { SeatSpec } from './spec.js';
 import type { RunResult } from '../proc/index.js';
+import { SeatUsageStore } from './usage.js';
 
 let dir: string;
 let ledger: Ledger;
@@ -101,7 +102,12 @@ describe('좌석 선택', () => {
     const broker = new SeatBroker({
       ledger,
       seats: [
-        fakeSeat({ id: 'codex', vendor: 'openai', quota: { window: 'day', limit: 1, resetAt: null } }),
+        // 한도를 걸려면 창 경계가 잡혀야 한다 — resetAt 없이는 브로커가 거부한다
+        fakeSeat({
+          id: 'codex',
+          vendor: 'openai',
+          quota: { window: 'day', limit: 1, resetAt: '00:00 UTC' },
+        }),
         fakeSeat({ id: 'claude', vendor: 'anthropic' }),
       ],
       runner: writeOut('답변'),
@@ -143,7 +149,9 @@ describe('실패와 폴백', () => {
     expect(first.reason).toContain('쿼터 소진');
 
     const second = await broker.ask({ persona: 'ceo', prompt: 'q' });
-    expect(second.reason).toContain('가용 좌석이 없다');
+    // 언제 풀리는지가 오너가 물을 첫 질문이다. 벤더가 말한 시각을 그대로 붙인다
+    expect(second.reason).toContain('쿼터 소진');
+    expect(second.reason).toMatch(/\d{4}-\d{2}-\d{2}T/);
     expect(broker.status().find((s) => s.seat === 'claude')?.exhausted).toBe(true);
   });
 
@@ -353,5 +361,148 @@ describe('looksExhausted', () => {
 
   it('알아보지 못하는 실패는 소진으로 단정하지 않는다', () => {
     expect(looksExhausted(fail(1, 'some other error'))).toBe(false);
+  });
+});
+
+/**
+ * Task 5.1 — `company` 는 부를 때마다 새 프로세스다. 장부가 없던 동안
+ * 카운터는 재시작 시 초기화되는 정도가 아니라 **한 번도 누적되지 않았고**,
+ * 벤더가 알려 준 소진 사실도 매 호출 잊혔다. 아래 시험에서 새 `SeatBroker`
+ * 인스턴스가 새 프로세스의 대역이다.
+ */
+describe('사용량이 프로세스를 넘어 남는다 (Task 5.1)', () => {
+  const CLAUDE_MSG = "You've hit your weekly limit · resets 8pm (Asia/Seoul)";
+  const seats = [fakeSeat({ id: 'claude', vendor: 'anthropic' })];
+  let usage: SeatUsageStore;
+
+  beforeEach(() => {
+    usage = new SeatUsageStore({ file: join(dir, 'seats', 'usage.json') });
+  });
+
+  it('장부가 없으면 카운터가 프로세스와 함께 사라진다', async () => {
+    const first = new SeatBroker({ ledger, seats, runner: writeOut('답') });
+    await first.ask({ persona: 'ceo', prompt: 'q' });
+    expect(first.status()[0]?.used).toBe(1);
+
+    const second = new SeatBroker({ ledger, seats, runner: writeOut('답') });
+    expect(second.status()[0]?.used).toBe(0);
+    expect(second.status()[0]?.persisted).toBe(false);
+  });
+
+  it('장부가 있으면 다음 프로세스가 이어서 센다', async () => {
+    const first = new SeatBroker({ ledger, seats, usage, runner: writeOut('답') });
+    await first.ask({ persona: 'ceo', prompt: 'q' });
+
+    const second = new SeatBroker({ ledger, seats, usage, runner: writeOut('답') });
+    expect(second.status()[0]?.used).toBe(1);
+    await second.ask({ persona: 'ceo', prompt: 'q' });
+    expect(new SeatBroker({ ledger, seats, usage, runner: writeOut('답') }).status()[0]?.used).toBe(2);
+  });
+
+  it('벤더가 말한 소진을 다음 프로세스가 기억한다', async () => {
+    const first = new SeatBroker({ ledger, seats, usage, runner: async () => fail(1, CLAUDE_MSG) });
+    await first.ask({ persona: 'ceo', prompt: 'q' });
+
+    let called = false;
+    const second = new SeatBroker({
+      ledger, seats, usage,
+      runner: async () => { called = true; return fail(1, CLAUDE_MSG); },
+    });
+    const r = await second.ask({ persona: 'ceo', prompt: 'q' });
+    // 벽인 줄 알면서 다시 치지 않는다
+    expect(called).toBe(false);
+    expect(r.reason).toContain('쿼터 소진 상태');
+    expect(second.status()[0]?.exhaustedUntil).not.toBeNull();
+  });
+
+  it('해제 시각이 지나면 다시 쓴다', async () => {
+    let now = Date.parse('2026-08-04T09:00:00.000Z');
+    const clock = (): number => now;
+    const store = new SeatUsageStore({ file: join(dir, 'seats', 'usage.json'), now: clock });
+    const a = new SeatBroker({ ledger, seats, usage: store, now: clock, runner: async () => fail(1, CLAUDE_MSG) });
+    await a.ask({ persona: 'ceo', prompt: 'q' });
+
+    now += 3 * 3_600_000; // 해제로 잡힌 20:00 KST 를 지난다
+    const b = new SeatBroker({ ledger, seats, usage: store, now: clock, runner: writeOut('답') });
+    const r = await b.ask({ persona: 'ceo', prompt: 'q' });
+    expect(r.ok).toBe(true);
+    // 답을 준 것이 소진이 아니라는 가장 확실한 근거다
+    expect(b.status()[0]?.exhausted).toBe(false);
+  });
+
+  /**
+   * 해제 시각을 모르는데 후보에서 빼면, 벤더 문구를 한 번 잘못 읽은 것만으로
+   * 좌석이 영원히 사라지고 회사가 멈춘다.
+   */
+  it('해제 시각을 모르면 빼지 않고 뒤로 민다', async () => {
+    const two = [
+      fakeSeat({ id: 'gemini', vendor: 'google' }),
+      fakeSeat({ id: 'codex', vendor: 'openai' }),
+    ];
+    const a = new SeatBroker({
+      ledger, seats: two, usage,
+      runner: async (spec, args) => {
+        if (spec.id === 'gemini') return fail(1, 'quota exceeded');
+        writeFileSync(args[1]!, 'codex 답', 'utf8');
+        return ok();
+      },
+    });
+    await a.ask({ persona: 'ceo', prompt: 'q', preferSeat: 'gemini' });
+    expect(usage.get('gemini', two[0]!).exhaustedUntil).toBeNull();
+
+    // 다음 프로세스: gemini 는 강등이므로 codex 가 먼저 불린다
+    const tried: string[] = [];
+    const b = new SeatBroker({
+      ledger, seats: two, usage,
+      runner: async (spec, args) => {
+        tried.push(spec.id);
+        writeFileSync(args[1]!, '답', 'utf8');
+        return ok();
+      },
+    });
+    await b.ask({ persona: 'ceo', prompt: 'q', preferSeat: 'gemini' });
+    expect(tried).toEqual(['codex']);
+
+    // 그래도 목록에는 남아 있다 — codex 가 죽으면 gemini 를 다시 친다
+    const solo: string[] = [];
+    const c = new SeatBroker({
+      ledger, seats: two, usage,
+      runner: async (spec) => { solo.push(spec.id); return fail(1); },
+    });
+    await c.ask({ persona: 'ceo', prompt: 'q' });
+    expect(solo).toContain('gemini');
+  });
+
+  /**
+   * 창을 못 잡는 좌석에 한도를 걸면 카운터가 영원히 안 줄어 좌석이 죽는다.
+   * 조용히 무시하지도, 조용히 죽이지도 않고 사양 단계에서 멈춘다.
+   */
+  it('집행할 수 없는 한도를 들고 출발하지 않는다', () => {
+    expect(
+      () =>
+        new SeatBroker({
+          ledger,
+          seats: [fakeSeat({ id: 'codex', vendor: 'openai', quota: { window: 'day', limit: 5, resetAt: null } })],
+        }),
+    ).toThrow(/집행할 창 경계/);
+  });
+});
+
+describe('화면과 선택 로직이 같은 말을 한다', () => {
+  it('해제 시각이 지나면 status 도 소진이 아니라고 말한다', async () => {
+    let now = Date.parse('2026-08-04T09:00:00.000Z');
+    const clock = (): number => now;
+    const seats = [fakeSeat({ id: 'claude', vendor: 'anthropic' })];
+    const usage = new SeatUsageStore({ file: join(dir, 'seats', 'usage.json'), now: clock });
+    const b = new SeatBroker({
+      ledger, seats, usage, now: clock,
+      runner: async () => fail(1, "You've hit your weekly limit · resets 8pm (Asia/Seoul)"),
+    });
+    await b.ask({ persona: 'ceo', prompt: 'q' });
+    expect(b.status()[0]?.exhausted).toBe(true);
+
+    now += 3 * 3_600_000; // 해제로 잡힌 시각을 지난다. 호출은 하지 않는다
+    expect(b.status()[0]?.exhausted).toBe(false);
+    expect(b.status()[0]?.exhaustedUntil).toBeNull();
   });
 });

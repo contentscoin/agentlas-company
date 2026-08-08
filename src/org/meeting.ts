@@ -21,6 +21,8 @@ import { runShell } from '../proc/index.js';
 import type { SeatBroker } from '../seats/broker.js';
 import type { Vendor } from '../seats/spec.js';
 import { CEO, CRITIC, personaById, type Persona, type PersonaId } from './personas.js';
+import { agendaKey, failuresFile, FailureStore, WAR_ROOM_THRESHOLD } from './failures.js';
+import { warRoomsFile, WarRoomStore } from './warroom.js';
 import {
   isCriticalDissent,
   parseCloseBlock,
@@ -40,6 +42,17 @@ export interface Turn {
 
 export type MeetingStatus = 'closed' | 'board-gate' | 'war-room' | 'failed';
 
+/**
+ * War Room 이 왜 열렸는가 (R3.7).
+ *
+ *   critic-block     Critic 이 BLOCK 을 냈다
+ *   repeat-failure   동일 과제가 문턱 횟수만큼 연속 실패했다
+ *
+ * 오너가 볼 화면과 할 일이 다르다. 하나로 뭉치면 "무엇이 막혔는지" 를
+ * 원장에서 다시 파헤쳐야 한다.
+ */
+export type WarRoomCause = 'critic-block' | 'repeat-failure';
+
 export interface MeetingResult {
   status: MeetingStatus;
   runId: string;
@@ -52,6 +65,16 @@ export interface MeetingResult {
   /** 업스트림 정규화를 건너뛴 이유. */
   normalizationSkipped?: string;
   reason?: string;
+  /** `status: 'war-room'` 일 때만 채워진다. */
+  warRoomCause?: WarRoomCause;
+  /**
+   * 열린 War Room 의 식별자. 오너가 이것으로 종결한다 (R3.7).
+   *
+   * 같은 안건에 이미 열린 방이 있으면 그 방의 id 다 — 소집이 쌓이지 않는다.
+   */
+  warRoomId?: string;
+  /** 이 안건의 연속 실패 횟수. 실패·소집 판단의 근거를 그대로 노출한다. */
+  failureStreak?: number;
 }
 
 export interface Seating {
@@ -67,6 +90,19 @@ export interface MeetingOptions {
   /** `companyctl.py` 경로. 없으면 업스트림 정규화를 건너뛴다. */
   companyctl?: string;
   timeoutMs?: number;
+  /**
+   * 동일 과제 연속 실패 장부 (R3.7). 주지 않으면 `stateDir` 아래에 만든다.
+   *
+   * 회의는 매번 새 프로세스에서 돌므로 이 카운터는 반드시 프로세스 밖에
+   * 있어야 한다 — 안에 두면 "2회 연속" 이 성립할 수가 없다.
+   */
+  failures?: FailureStore;
+  /**
+   * 열린 War Room 장부 (R3.7). 주지 않으면 `stateDir` 아래에 만든다.
+   *
+   * 소집이 반환값으로만 존재하면 오너가 종결할 대상 자체가 없다.
+   */
+  warRooms?: WarRoomStore;
 }
 
 export interface MeetingRequest {
@@ -110,6 +146,8 @@ export class Meeting {
   private readonly stateDir: string;
   private readonly companyctl: string | undefined;
   private readonly timeoutMs: number;
+  private readonly failures: FailureStore;
+  private readonly warRooms: WarRoomStore;
 
   constructor(opts: MeetingOptions) {
     this.ledger = opts.ledger;
@@ -117,6 +155,44 @@ export class Meeting {
     this.stateDir = opts.stateDir;
     this.companyctl = opts.companyctl;
     this.timeoutMs = opts.timeoutMs ?? 300_000;
+    this.failures = opts.failures ?? new FailureStore({ file: failuresFile(opts.stateDir) });
+    this.warRooms = opts.warRooms ?? new WarRoomStore({ file: warRoomsFile(opts.stateDir) });
+  }
+
+  /**
+   * War Room 을 연다. 소집은 여기 한 곳에서만 일어난다 (R3.7).
+   *
+   * 두 트리거가 각자 방을 열면 한쪽이 장부에 안 남는 일이 생긴다 — 실제로
+   * 소집 자체가 반환값에만 있던 것이 이 결함이었다.
+   */
+  private convene(
+    req: MeetingRequest,
+    cause: WarRoomCause,
+    reason: string,
+  ): string {
+    const { room, created } = this.warRooms.convene({
+      cause,
+      // 목록에서 구분할 만큼만. 안건 전문을 장부에 담지 않는다 (R9).
+      subject: summarize(req.agenda),
+      agendaDigest: agendaKey(req.agenda),
+      runId: req.runId,
+      reason,
+    });
+    this.ledger.append({
+      actor: { kind: 'system', id: 'meeting' },
+      kind: 'decision',
+      runId: req.runId,
+      level: 'L3',
+      payloadDigest: room.agendaDigest,
+      summary:
+        (created
+          ? `War Room ${room.id} 소집 (${cause}) — 오너만 종결할 수 있다`
+          : `War Room ${room.id} 이 이미 열려 있다 (${cause}) — 새로 열지 않는다`) +
+        // R3.5 는 BLOCK 한 건이 다수결로 뒤집히지 않는다는 규칙이다.
+        // 소집 기록에 그 이유가 붙어 있어야 나중에 원장만 보고도 안다.
+        (cause === 'critic-block' ? '. 다수결로 기각하지 않는다' : ''),
+    });
+    return room.id;
   }
 
   async run(req: MeetingRequest): Promise<MeetingResult> {
@@ -179,18 +255,21 @@ export class Meeting {
       ...(norm.skipped !== undefined ? { normalizationSkipped: norm.skipped } : {}),
     };
 
+    // 여기까지 왔으면 이 안건은 마감 블록까지 만들어졌다. 연속 실패가
+    // 끊긴 것이고, 끊지 않으면 몇 달 전 실패 한 번이 다음 실패와 이어져
+    // 엉뚱한 시점에 War Room 을 부른다.
+    this.failures.clear(req.agenda);
+
     // R3.5 / R3.7 — BLOCK 은 다수결로 기각되지 않는다
     if (isCriticalDissent(verdict)) {
-      this.ledger.append({
-        actor: { kind: 'system', id: 'meeting' },
-        kind: 'decision',
-        runId: req.runId,
-        level: 'L3',
-        summary:
-          `Critic BLOCK — War Room 소집. 다수결로 기각하지 않는다. ` +
-          `오너만 종결할 수 있다. 사유 ${verdict.blockers.length}건`,
-      });
-      return { ...base, status: 'war-room', reason: verdict.blockers.join(' / ') };
+      const reason = verdict.blockers.join(' / ');
+      return {
+        ...base,
+        status: 'war-room',
+        reason,
+        warRoomCause: 'critic-block',
+        warRoomId: this.convene(req, 'critic-block', reason),
+      };
     }
 
     this.ledger.append({
@@ -298,14 +377,46 @@ export class Meeting {
     }
   }
 
+  /**
+   * 회의 실패를 기록하고, 문턱에 닿으면 War Room 으로 올린다 (R3.7 전반부).
+   *
+   * 문턱에 닿으면 연속을 끊는다. 그대로 두면 다음 실패 한 번에 즉시 다시
+   * 소집되어, 한 번 어긋난 안건이 영구히 경보를 낸다.
+   */
   private fail(req: MeetingRequest, reason: string): MeetingResult {
+    const streak = this.failures.recordFailure(req.agenda, req.runId);
+
     this.ledger.append({
       actor: { kind: 'system', id: 'meeting' },
       kind: 'deny',
       runId: req.runId,
-      summary: `회의 실패 — ${reason}`,
+      // 안건 원문은 남기지 않는다 (R9). digest 앞자리로 같은 과제임을 대조한다.
+      payloadDigest: agendaKey(req.agenda),
+      summary: `회의 실패 (동일 과제 연속 ${streak.count}회) — ${reason}`,
     });
-    return { status: 'failed', runId: req.runId, round1: [], round2: [], reason };
+
+    if (streak.count < WAR_ROOM_THRESHOLD) {
+      return { status: 'failed', runId: req.runId, round1: [], round2: [], reason, failureStreak: streak.count };
+    }
+
+    this.failures.clear(req.agenda);
+    const warRoomId = this.convene(
+      req,
+      'repeat-failure',
+      `동일 과제 ${streak.count}회 연속 실패 (직전 ${streak.lastRunId}) — ${reason}`,
+    );
+    return {
+      status: 'war-room',
+      runId: req.runId,
+      warRoomId,
+      round1: [],
+      round2: [],
+      // 사유만 담는다. 횟수는 `failureStreak` 이, 무엇 때문인지는
+      // `warRoomCause` 가 말한다 — 한 문장에 세 번 되풀이하지 않는다.
+      reason,
+      warRoomCause: 'repeat-failure',
+      failureStreak: streak.count,
+    };
   }
 }
 
@@ -384,4 +495,17 @@ export function buildCeoPrompt(
   ]
     .filter((l) => l !== '')
     .join('\n');
+}
+
+/**
+ * 목록에서 구분할 만큼의 짧은 제목.
+ *
+ * 안건 **전문**은 장부에 담지 않는다 (R9). 그렇다고 digest 만 두면 오너가
+ * 화면에서 어느 방이 무엇인지 알 수 없어 종결 판단을 못 한다. 첫 줄의
+ * 앞부분만 남기는 것이 그 사이의 타협이고, 이것은 오너 전용 0600 파일에서
+ * 오너에게만 보인다.
+ */
+export function summarize(agenda: string, max = 60): string {
+  const line = agenda.split('\n')[0]?.trim() ?? '';
+  return line.length <= max ? line : `${line.slice(0, max - 1)}…`;
 }

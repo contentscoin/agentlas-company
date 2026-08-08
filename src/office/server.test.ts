@@ -9,6 +9,7 @@ import { DEFAULT_POLICY } from '../policy/policy.js';
 import { OfficeServer } from './server.js';
 import { DeviceStore } from './tokens.js';
 import { RefuseAllStepUp, TotpStepUp, totpCode, base32Decode } from './stepup.js';
+import { warRoomsFile, WarRoomStore } from '../org/warroom.js';
 
 let dir: string;
 let ledger: Ledger;
@@ -21,13 +22,14 @@ let token: string;
 let deviceId: string;
 
 /** 서버를 띄우고 기기 하나를 등록한다. */
-async function boot(stepUp = new RefuseAllStepUp()): Promise<void> {
+async function boot(stepUp = new RefuseAllStepUp(), warRooms?: WarRoomStore): Promise<void> {
   server = new OfficeServer({
     ledger,
     approvals,
     capabilities,
     devices,
     stepUp,
+    ...(warRooms ? { warRooms } : {}),
     host: '127.0.0.1',
     port: 0,
     pollMs: 50,
@@ -449,5 +451,129 @@ describe('측정 화면 (R11.6)', () => {
 
   it('토큰 없이는 못 본다', async () => {
     expect((await fetch(`${base}/api/measurements`)).status).toBe(401);
+  });
+});
+
+/**
+ * R3.7 의 뒷문장 — "오너만이 종결할 수 있게". 소집이 반환값으로만 존재하던
+ * 동안에는 닫을 대상이 없어 이 경로 자체가 없었다.
+ */
+describe('War Room 종결 (R3.7)', () => {
+  let rooms: WarRoomStore;
+  let secret: string;
+  let roomId: string;
+
+  async function bootWithRooms(): Promise<void> {
+    server.close();
+    rooms = new WarRoomStore({ file: warRoomsFile(dir) });
+    roomId = rooms.convene({
+      cause: 'critic-block',
+      subject: '가격 정책을 정하자',
+      agendaDigest: 'digest-a',
+      runId: 'r1',
+      reason: '근거 없음',
+    }).room.id;
+    const totp = new TotpStepUp({ file: join(dir, 'stepup.json') });
+    secret = totp.enroll(deviceId).secret;
+    await boot(totp, rooms);
+  }
+
+  const code = (): string => totpCode(base32Decode(secret), Date.now());
+
+  it('열린 방을 보여 준다', async () => {
+    await bootWithRooms();
+    const body = (await (await call('/api/warrooms')).json()) as {
+      configured: boolean;
+      open: { id: string; cause: string }[];
+    };
+    expect(body.configured).toBe(true);
+    expect(body.open).toHaveLength(1);
+    expect(body.open[0]?.cause).toBe('critic-block');
+  });
+
+  /**
+   * 장부를 안 붙인 것과 소집된 적이 없는 것은 다른 사실이다. 후자로 보이면
+   * 화면이 "이상 없음" 이라고 거짓말한다 (R10.3 과 같은 규칙).
+   */
+  it('장부가 없으면 빈 목록이 아니라 configured:false 다', async () => {
+    const body = (await (await call('/api/warrooms')).json()) as { configured: boolean };
+    expect(body.configured).toBe(false);
+    expect((await call(`/api/warrooms/x/close`, { method: 'POST', body: {} })).status).toBe(503);
+  });
+
+  it('토큰 없이 볼 수 없다', async () => {
+    await bootWithRooms();
+    expect((await call('/api/warrooms', { token: null })).status).toBe(401);
+  });
+
+  it('인증 코드 없이 닫을 수 없다 — 오너만 종결한다', async () => {
+    await bootWithRooms();
+    const res = await call(`/api/warrooms/${roomId}/close`, {
+      method: 'POST',
+      body: { resolution: '확인했다' },
+    });
+    expect(res.status).toBe(403);
+    expect(rooms.open()).toHaveLength(1);
+    expect(ledger.query({ kind: 'deny' }).some((e) => (e.summary ?? '').includes('종결 거부'))).toBe(true);
+  });
+
+  it('사유 없이 닫을 수 없다', async () => {
+    await bootWithRooms();
+    const res = await call(`/api/warrooms/${roomId}/close`, {
+      method: 'POST',
+      body: { stepUp: code(), resolution: '   ' },
+    });
+    expect(res.status).toBe(400);
+    expect(rooms.open()).toHaveLength(1);
+  });
+
+  /**
+   * 인증 코드는 한 번 쓰면 끝이다. 어차피 실패할 요청에 코드를 태우면 오너는
+   * 다음 창까지 30초를 기다려야 한다 — 실측에서 실제로 그 상태에 빠졌다.
+   */
+  it('사유가 없어 거부된 요청은 인증 코드를 태우지 않는다', async () => {
+    await bootWithRooms();
+    const one = code();
+    await call(`/api/warrooms/${roomId}/close`, { method: 'POST', body: { stepUp: one } });
+    const res = await call(`/api/warrooms/${roomId}/close`, {
+      method: 'POST',
+      body: { stepUp: one, resolution: '확인했다' },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('둘 다 갖추면 닫히고 누가 닫았는지 남는다', async () => {
+    await bootWithRooms();
+    const res = await call(`/api/warrooms/${roomId}/close`, {
+      method: 'POST',
+      body: { stepUp: code(), resolution: '재시도해서 통과 확인' },
+    });
+    expect(res.status).toBe(200);
+    const closed = rooms.get(roomId);
+    expect(closed?.closedBy).toBe(`device:${deviceId}`);
+    expect(closed?.resolution).toBe('재시도해서 통과 확인');
+    expect(rooms.open()).toHaveLength(0);
+    expect(ledger.query({ kind: 'decision' }).some((e) => (e.summary ?? '').includes('종결'))).toBe(true);
+  });
+
+  /** 폰 둘이 같은 목록을 띄워 놓으면 정상 경로에서 생긴다. */
+  it('이미 닫힌 방은 409 다', async () => {
+    await bootWithRooms();
+    rooms.close(roomId, 'device:다른폰', '먼저 판단');
+    const res = await call(`/api/warrooms/${roomId}/close`, {
+      method: 'POST',
+      body: { stepUp: code(), resolution: '두 번째' },
+    });
+    expect(res.status).toBe(409);
+    expect(rooms.get(roomId)?.resolution).toBe('먼저 판단');
+  });
+
+  it('없는 방은 404 다', async () => {
+    await bootWithRooms();
+    const res = await call('/api/warrooms/wr-없음/close', {
+      method: 'POST',
+      body: { stepUp: code(), resolution: '사유' },
+    });
+    expect(res.status).toBe(404);
   });
 });

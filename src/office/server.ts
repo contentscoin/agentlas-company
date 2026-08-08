@@ -26,6 +26,7 @@ import type { DeviceRecord, DeviceStore } from './tokens.js';
 import type { StepUpVerifier } from './stepup.js';
 import { CONSOLE_HTML } from './console.js';
 import type { MetricsStore } from '../metrics/store.js';
+import { WarRoomError, type WarRoomStore } from '../org/warroom.js';
 
 export interface OfficeServerOptions {
   ledger: Ledger;
@@ -45,6 +46,14 @@ export interface OfficeServerOptions {
    * 기록을 안 켠 것은 다른 사실이다.
    */
   metricsStore?: MetricsStore;
+  /**
+   * 열린 War Room 장부 (R3.7). 없으면 종결 화면이 "장부 안 켬" 으로 보인다.
+   *
+   * 선택으로 둔 이유는 오피스 서버가 회의 없이도 돌아야 하기 때문이고,
+   * **없는 것을 "열린 방 없음" 으로 보이게 하지 않는다** — 소집된 적이
+   * 없는 것과 장부를 안 붙인 것은 다른 사실이다.
+   */
+  warRooms?: WarRoomStore;
 }
 
 interface Ctx {
@@ -218,6 +227,10 @@ export class OfficeServer {
         return this.panic(ctx);
       case route === 'GET /api/measurements':
         return this.getMeasurements(ctx);
+      case route === 'GET /api/warrooms':
+        return this.getWarRooms(ctx);
+      case /^POST \/api\/warrooms\/[^/]+\/close$/.test(route):
+        return this.closeWarRoom(ctx);
       case route === 'GET /api/devices':
         return json(res, 200, { devices: this.opts.devices.list() });
       default:
@@ -408,6 +421,14 @@ export class OfficeServer {
       return;
     }
 
+    // digest 검사를 인증보다 먼저 한다. 인증 코드는 한 번 쓰면 끝이라,
+    // digest 를 빠뜨린 요청에 코드를 태우면 오너가 다음 창까지 기다려야 한다
+    // (War Room 종결 실측에서 같은 함정을 밟았다).
+    if (action === 'approve' && typeof ctx.body.digest !== 'string') {
+      json(ctx.res, 400, { error: 'digest-required' });
+      return;
+    }
+
     if (card.level === 'L3') {
       const proof = typeof ctx.body.stepUp === 'string' ? ctx.body.stepUp : '';
       const verdict = this.opts.stepUp.verify(ctx.device, proof, `approval:${id}`);
@@ -453,6 +474,103 @@ export class OfficeServer {
     // 아니오이고, 여기서 막으면 오너가 거부하지 못하는 상태가 생긴다.
     const outcome = this.opts.approvals.reject(id, submitter, String(ctx.body.reason ?? '오너 거부'));
     json(ctx.res, outcome.ok ? 200 : 409, outcome);
+  }
+
+  // ── War Room (R3.7) ─────────────────────────────────────────────
+
+  /**
+   * 열린 방과 최근에 닫힌 방.
+   *
+   * 장부가 없으면 빈 목록이 아니라 `configured: false` 다. 소집된 적이 없는
+   * 것과 장부를 안 붙인 것은 다른 사실이고, 후자를 "이상 없음" 으로 보이게
+   * 하면 화면이 거짓말을 한다 (R10.3 과 같은 규칙).
+   */
+  private getWarRooms(ctx: Ctx): void {
+    const store = this.opts.warRooms;
+    if (store === undefined) {
+      json(ctx.res, 200, { configured: false, open: [], recent: [] });
+      return;
+    }
+    const all = store.list();
+    json(ctx.res, 200, {
+      configured: true,
+      open: all.filter((r) => r.closedAt === null),
+      recent: all.filter((r) => r.closedAt !== null).slice(0, 20),
+    });
+  }
+
+  /**
+   * 종결한다 — **오너만** (R3.7).
+   *
+   * 단계별 인증을 요구한다. 종결은 통제 승격을 푸는 행위이고, 이 시스템은
+   * 그 등급의 행위에 두 번째 요소를 요구한다(L3). 기기 토큰만으로 열어 두면
+   * 폰을 잠깐 쥔 사람이 Critic 이 BLOCK 한 사안을 지울 수 있다.
+   *
+   * 사유를 요구한다. 사유 없는 종결은 목록에서 지우는 것과 같고, 그러면
+   * 나중에 "왜 괜찮다고 판단했나" 에 답할 기록이 없다.
+   */
+  private closeWarRoom(ctx: Ctx): void {
+    const store = this.opts.warRooms;
+    if (store === undefined) {
+      json(ctx.res, 503, { error: 'warrooms-not-configured' });
+      return;
+    }
+    const id = decodeURIComponent(ctx.url.pathname.split('/')[3] ?? '');
+    const room = store.get(id);
+    if (room === null) {
+      json(ctx.res, 404, { error: 'warroom-not-found' });
+      return;
+    }
+
+    // **싼 검사를 먼저 한다.** 인증 코드는 한 번 쓰면 끝이므로(재사용 금지),
+    // 어차피 실패할 요청에 코드를 태우면 오너는 다음 창까지 30초를 기다려야
+    // 한다. 실측에서 실제로 그 상태에 빠졌다.
+    const resolution = typeof ctx.body.resolution === 'string' ? ctx.body.resolution : '';
+    if (resolution.trim() === '') {
+      json(ctx.res, 400, { error: 'resolution-required' });
+      return;
+    }
+    if (room.closedAt !== null) {
+      json(ctx.res, 409, {
+        error: 'warroom-conflict',
+        reason: `War Room ${id} 는 이미 ${room.closedBy ?? '누군가'} 가 종결했다`,
+      });
+      return;
+    }
+
+    const proof = typeof ctx.body.stepUp === 'string' ? ctx.body.stepUp : '';
+    const verdict = this.opts.stepUp.verify(ctx.device, proof, `warroom:${id}`);
+    if (!verdict.ok) {
+      this.opts.ledger.append({
+        actor: { kind: 'owner', id: `device:${ctx.device.id}` },
+        kind: 'deny',
+        level: 'L3',
+        summary: `War Room ${id} 종결 거부 — 단계별 인증 실패 (${verdict.reason})`,
+      });
+      json(ctx.res, 403, { error: 'step-up-required', reason: verdict.reason });
+      return;
+    }
+
+    try {
+      const closed = store.close(id, `device:${ctx.device.id}`, resolution);
+      this.opts.ledger.append({
+        actor: { kind: 'owner', id: `device:${ctx.device.id}` },
+        kind: 'decision',
+        runId: closed.runId,
+        level: 'L3',
+        payloadDigest: closed.agendaDigest,
+        summary: `War Room ${closed.id} 종결 (${closed.cause}) — ${ctx.device.label}`,
+      });
+      json(ctx.res, 200, { ok: true, room: closed });
+    } catch (err) {
+      // 이미 닫힌 방을 다시 닫으려는 것이 정상 경로에서 생긴다 — 폰 둘이
+      // 같은 목록을 띄워 놓은 경우다. 오류가 아니라 충돌로 알린다.
+      if (err instanceof WarRoomError) {
+        json(ctx.res, 409, { error: 'warroom-conflict', reason: err.message });
+        return;
+      }
+      throw err;
+    }
   }
 
   // ── 능력 스위치 (R14.8) ─────────────────────────────────────────
