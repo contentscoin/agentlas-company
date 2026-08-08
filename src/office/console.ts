@@ -233,6 +233,7 @@ export const CONSOLE_HTML = `<!doctype html>
 
     <nav class="tabs" role="tablist">
       <button role="tab" class="tab on" data-view="approvals">승인 <span class="badge" id="b-appr"></span></button>
+      <button role="tab" class="tab" data-view="warrooms">War Room <span class="badge" id="b-war"></span></button>
       <button role="tab" class="tab" data-view="runs">실행 <span class="badge" id="b-runs"></span></button>
       <button role="tab" class="tab" data-view="measure">측정</button>
       <button role="tab" class="tab" data-view="ledger">원장</button>
@@ -240,6 +241,7 @@ export const CONSOLE_HTML = `<!doctype html>
 
     <div id="msg"></div>
     <div id="list"></div>
+    <div id="warrooms" class="hidden"></div>
     <div id="runs" class="hidden"></div>
     <div id="measure" class="hidden"></div>
     <div id="ledger" class="hidden"></div>
@@ -264,6 +266,7 @@ export const CONSOLE_HTML = `<!doctype html>
   var lastSeq = 0;
   var view = 'approvals';
   var measure = null;   // null = 아직 안 읽음
+  var warrooms = null;  // null = 아직 안 읽음. 배지를 채우려고 처음에 한 번 읽는다
   var MAX_EVENTS = 300; // 폰에서 무한히 쌓지 않는다
 
   // 주소창 조각(#token=…)으로 한 번에 넣을 수 있게 한다. 조각은 서버로
@@ -516,14 +519,109 @@ export const CONSOLE_HTML = `<!doctype html>
     });
   }
 
+  /**
+   * War Room 은 오너만 닫는다 (R3.7). 화면은 그 사실을 숨기지 않는다 —
+   * 인증 코드와 종결 사유를 둘 다 받는다. 사유 없는 종결은 목록에서
+   * 지우는 것과 같아서, 나중에 "왜 괜찮다고 판단했나" 에 답할 기록이 없다.
+   */
+  function warRoomCard(r) {
+    var why = r.cause === 'critic-block' ? 'Critic BLOCK' : '동일 과제 반복 실패';
+    return (
+      '<div class="card irreversible" data-war="' + esc(r.id) + '">' +
+        '<div class="row">' +
+          '<span class="lvl L3">L3</span>' +
+          '<span class="tag">' + esc(why) + '</span>' +
+          '<span class="action mono">' + esc(r.id) + '</span>' +
+        '</div>' +
+        '<p class="summary">' + esc(r.subject || '(제목 없음)') + '</p>' +
+        '<p class="sub">' + esc(r.reason) + '</p>' +
+        '<p class="sub mono">소집 ' + esc(r.openedAt) + ' · run ' + esc(r.runId) + '</p>' +
+        '<input id="wres-' + esc(r.id) + '" placeholder="종결 사유 — 무엇을 확인했는지" autocomplete="off">' +
+        '<input id="wcode-' + esc(r.id) + '" placeholder="인증 코드 6자리" inputmode="numeric" autocomplete="one-time-code">' +
+        '<div class="acts">' +
+          '<button class="approve" data-close="' + esc(r.id) + '">종결</button>' +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  function closedCard(r) {
+    return (
+      '<div class="card">' +
+        '<p class="summary">' + esc(r.subject || '(제목 없음)') + '</p>' +
+        '<p class="sub">' + esc(r.resolution) + '</p>' +
+        '<p class="sub mono">' + esc(r.closedAt) + ' · ' + esc(r.closedBy) + '</p>' +
+      '</div>'
+    );
+  }
+
+  function renderWarRooms() {
+    var el = $('warrooms');
+    if (warrooms === null) { el.innerHTML = '<div class="empty">읽는 중…</div>'; return; }
+    // 장부가 없는 것과 열린 방이 없는 것은 다른 사실이다. 섞지 않는다.
+    if (!warrooms.configured) {
+      el.innerHTML =
+        '<div class="empty"><div class="big">War Room 장부가 붙어 있지 않습니다</div>' +
+        '<div>소집이 일어나도 여기 남지 않습니다. 이상 없다는 뜻이 아닙니다.</div></div>';
+      return;
+    }
+    var open = warrooms.open || [];
+    var recent = warrooms.recent || [];
+    var html = open.length
+      ? open.map(warRoomCard).join('')
+      : '<div class="empty"><div class="big">열린 War Room 이 없습니다</div>' +
+        '<div>Critic 이 BLOCK 하거나 같은 과제가 두 번 실패하면 여기 열립니다.</div></div>';
+    if (recent.length) {
+      html += '<h3>최근 종결</h3>' + recent.map(closedCard).join('');
+    }
+    el.innerHTML = html;
+  }
+
+  function loadWarRooms() {
+    return api('/api/warrooms').then(function (r) {
+      if (r.status !== 200) return;
+      warrooms = r.body || { configured: false };
+      if (view === 'warrooms') renderWarRooms(); else paint();
+    });
+  }
+
+  function closeWarRoom(id, btn) {
+    var res = ($('wres-' + id) && $('wres-' + id).value || '').trim();
+    var code = ($('wcode-' + id) && $('wcode-' + id).value || '').trim();
+    if (!res) { say($('msg'), '종결 사유를 적어 주세요', 'err'); return; }
+    if (!code) { say($('msg'), 'War Room 종결에는 인증 코드가 필요합니다', 'err'); return; }
+    btn.disabled = true;
+    api('/api/warrooms/' + encodeURIComponent(id) + '/close', {
+      method: 'POST',
+      body: { resolution: res, stepUp: code },
+    })
+      .then(function (r) {
+        if (r.status === 200) say($('msg'), '종결했습니다', 'ok');
+        else if (r.status === 403) say($('msg'), '인증 코드가 맞지 않습니다', 'err');
+        else if (r.status === 409 && r.body && r.body.reason) say($('msg'), r.body.reason, 'err');
+        else say($('msg'), (r.body && r.body.error) || '처리하지 못했습니다', 'err');
+        return loadWarRooms();
+      })
+      .catch(function () { say($('msg'), '서버에 닿지 못했습니다', 'err'); })
+      .then(function () { btn.disabled = false; });
+  }
+
   function paint() {
     $('b-appr').textContent = cards.length ? String(cards.length) : '';
     $('b-runs').textContent = runs.length ? String(runs.length) : '';
+    var openWar = warrooms && warrooms.open ? warrooms.open.length : 0;
+    $('b-war').textContent = openWar ? String(openWar) : '';
     var meta = $('meta');
     if (view === 'approvals') {
       $('title').textContent = '승인';
       meta.textContent = cards.length ? cards.length + '건 대기' : '대기 없음';
       render();
+    } else if (view === 'warrooms') {
+      $('title').textContent = 'War Room';
+      meta.textContent = warrooms && !warrooms.configured
+        ? '장부 없음'
+        : (openWar ? openWar + '건 열림' : '열린 방 없음');
+      renderWarRooms();
     } else if (view === 'runs') {
       $('title').textContent = '실행';
       meta.textContent = runs.length ? runs.length + '건 진행 중' : '진행 중 없음';
@@ -543,7 +641,8 @@ export const CONSOLE_HTML = `<!doctype html>
   function switchTo(next) {
     view = next;
     if (next === 'measure' && measure === null) loadMeasure();
-    ['approvals', 'runs', 'measure', 'ledger'].forEach(function (v) {
+    if (next === 'warrooms' && warrooms === null) loadWarRooms();
+    ['approvals', 'warrooms', 'runs', 'measure', 'ledger'].forEach(function (v) {
       var pane = $(v === 'approvals' ? 'list' : v);
       pane.classList.toggle('hidden', v !== next);
     });
@@ -577,11 +676,15 @@ export const CONSOLE_HTML = `<!doctype html>
       if (r.status === 401) { lock('토큰이 유효하지 않습니다'); return; }
       cards = (r.body && r.body.pending) || [];
       paint();
-      return loadState().then(function () {
-        // 수집·복기는 원장에 흔적을 남긴다. 원장이 움직였으면 측정도 다시 읽는다.
-        if (measure !== null) return loadMeasure();
-        return undefined;
-      });
+      return loadState()
+        // 배지에 열린 방 수를 띄우려면 탭에 들어가기 전에 한 번 읽어야 한다.
+        // 열려 있는데 안 보이면 오너가 그것을 모른다 — 그게 이 결함이었다.
+        .then(loadWarRooms)
+        .then(function () {
+          // 수집·복기는 원장에 흔적을 남긴다. 원장이 움직였으면 측정도 다시 읽는다.
+          if (measure !== null) return loadMeasure();
+          return undefined;
+        });
     });
   }
 
@@ -658,7 +761,10 @@ export const CONSOLE_HTML = `<!doctype html>
   }
 
   document.addEventListener('click', function (e) {
-    var btn = e.target.closest ? e.target.closest('button[data-act]') : null;
+    if (!e.target.closest) return;
+    var war = e.target.closest('button[data-close]');
+    if (war) { closeWarRoom(war.getAttribute('data-close'), war); return; }
+    var btn = e.target.closest('button[data-act]');
     if (!btn) return;
     var card = btn.closest('.card');
     if (card) decide(card.getAttribute('data-id'), btn.getAttribute('data-act'), btn);

@@ -81,6 +81,7 @@ import type { Submitter } from './policy/types.js';
 import { randomUUID } from 'node:crypto';
 import { Meeting } from './org/meeting.js';
 import { WAR_ROOM_THRESHOLD } from './org/failures.js';
+import { WarRoomError, WarRoomStore, warRoomsFile } from './org/warroom.js';
 import { RecipeEngine } from './recipes/engine.js';
 import { loadRecipe } from './recipes/load.js';
 import type { Recipe, RetroStep } from './recipes/types.js';
@@ -456,6 +457,91 @@ function reportStepUpFailure(argv: string[], f: Extract<StepUpOutcome, { ok: fal
   return EXIT_CANNOT_RUN;
 }
 
+/**
+ * War Room — 목록과 종결 (R3.7).
+ *
+ * 종결은 오너만 한다. CLI 에서도 오피스 API 와 같은 문턱을 둔다 —
+ * 단계별 인증과 사유. 한쪽이 느슨하면 느슨한 쪽이 실질 규칙이 된다.
+ */
+function cmdWarRoom(argv: string[]): number {
+  const store = warRoomStore();
+  // `argv[1]` 을 그대로 쓰면 `company warroom --json` 이 `--json` 을 하위
+  // 명령으로 읽는다. 실제로 그렇게 실패했다.
+  const sub = subcommand(argv);
+
+  if (sub === undefined || sub === 'list') {
+    const all = store.list();
+    const open = all.filter((r) => r.closedAt === null);
+    if (hasFlag(argv, '--json')) {
+      jsonOut({ open, closed: all.filter((r) => r.closedAt !== null) });
+      return open.length > 0 ? EXIT_FINDING : EXIT_OK;
+    }
+    if (open.length === 0) {
+      out('열린 War Room 없음');
+      return EXIT_OK;
+    }
+    for (const r of open) {
+      const why = r.cause === 'critic-block' ? 'Critic BLOCK' : '동일 과제 반복 실패';
+      out(`${r.id}  ${why}`);
+      out(`    ${r.subject}`);
+      out(`    ${r.reason}`);
+      out(`    소집 ${r.openedAt} · run ${r.runId}`);
+      out(`    company warroom close ${r.id} --reason "<확인한 것>" --step-up <코드>`);
+    }
+    // 열린 방이 있으면 정상 종료가 아니다. 스케줄러가 이 값을 본다.
+    return EXIT_FINDING;
+  }
+
+  if (sub !== 'close') {
+    process.stderr.write(`알 수 없는 하위 명령: ${sub}\n`);
+    return EXIT_CANNOT_RUN;
+  }
+
+  const id = argv[2];
+  if (!id) {
+    process.stderr.write('War Room id 가 필요합니다.\n');
+    return EXIT_CANNOT_RUN;
+  }
+  const reason = flagValue(argv, '--reason');
+  if (!reason || reason.trim() === '') {
+    process.stderr.write(
+      '--reason 은 필수입니다. 사유 없는 종결은 목록에서 지우는 것과 같습니다.\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  // 종결은 통제 승격을 푸는 행위다. 승인 L3 과 같은 문턱을 둔다.
+  const step = resolveStepUp(argv);
+  if (!step.ok) return reportStepUpFailure(argv, step);
+  if (!step.stepUp) {
+    process.stderr.write(
+      'War Room 종결에는 --step-up <코드> 가 필요합니다. 오너만 종결할 수 있습니다 (R3.7).\n',
+    );
+    return EXIT_CANNOT_RUN;
+  }
+
+  try {
+    const closed = store.close(id, `cli:${step.device}`, reason);
+    Ledger.open(ledgerPath(argv)).append({
+      actor: { kind: 'owner', id: `cli:${step.device}` },
+      kind: 'decision',
+      runId: closed.runId,
+      level: 'L3',
+      payloadDigest: closed.agendaDigest,
+      summary: `War Room ${closed.id} 종결 (${closed.cause}) — ${step.device}`,
+    });
+    out(`War Room ${closed.id} 종결`);
+    out(`  사유: ${closed.resolution ?? ''}`);
+    return EXIT_OK;
+  } catch (err) {
+    if (err instanceof WarRoomError) {
+      process.stderr.write(`종결 실패: ${err.message}\n`);
+      return EXIT_FINDING;
+    }
+    throw err;
+  }
+}
+
 /** 오너 신원. 단계별 인증은 `resolveStepUp` 이 판정한 결과를 받는다. */
 function ownerCaller(argv: string[], step?: Extract<StepUpOutcome, { ok: true }>): Caller {
   return {
@@ -570,6 +656,11 @@ function cmdCaps(argv: string[]): number {
  */
 function metricsStore(): MetricsStore {
   return new MetricsStore({ file: join(resolveState(), 'metrics', 'records.json') });
+}
+
+/** 열린 War Room 장부 (R3.7). 회의와 오피스가 같은 파일을 본다. */
+function warRoomStore(): WarRoomStore {
+  return new WarRoomStore({ file: warRoomsFile(resolveState()) });
 }
 
 function metricsBroker(ledger: Ledger, opts: { statsUrl?: string } = {}): MetricsBroker {
@@ -820,6 +911,10 @@ async function cmdMeeting(argv: string[]): Promise<number> {
     );
     out(`사유: ${result.reason}`);
     out('오너만 종결할 수 있습니다.');
+    if (result.warRoomId) {
+      out(`  War Room ${result.warRoomId} — 종결하기 전까지 열린 채로 남습니다.`);
+      out(`  종결: company warroom close ${result.warRoomId} --reason "<확인한 것>" --step-up <코드>`);
+    }
   }
   if (result.status === 'failed') {
     out('');
@@ -1138,6 +1233,7 @@ async function cmdOffice(argv: string[]): Promise<number> {
     // 통과시키던 자리를 거부가 대신한다 (Task 8.1).
     stepUp: enrolledAny ? totp : new RefuseAllStepUp(),
     metricsStore: metricsStore(),
+    warRooms: warRoomStore(),
     host,
     port,
   });
@@ -2172,6 +2268,8 @@ function usage(): void {
   out('');
   out('  정책과 승인 (R4)');
   out('  company classify <작업> [--tainted] [--critic BLOCK] [--sei-risk]');
+  out('  company warroom                     열린 War Room (R3.7)');
+  out('  company warroom close <id> --reason "<확인한 것>" --step-up <코드>');
   out('  company approvals                   대기 중인 승인 카드');
   out('  company approvals approve <id> --digest <d> [--step-up <코드>] [--device 기기ID]');
   out('  company approvals reject <id> [--reason 사유]');
@@ -2282,6 +2380,8 @@ async function main(): Promise<number> {
         return cmdSchedule(argv);
       case 'meeting':
         return await cmdMeeting(argv);
+      case 'warroom':
+        return cmdWarRoom(argv);
       case undefined:
       case '-h':
       case '--help':
